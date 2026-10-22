@@ -1,0 +1,25 @@
+[Unit]
+# %i 为监控实例的 UUID；启动限制防止运行器反复崩溃。
+Description=Agent wakeup watcher %i
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# uv 和项目路径由 register 在当前机器上解析。
+Type=exec
+ExecStart={command}
+WorkingDirectory={working_directory}
+Environment=PYTHONUNBUFFERED=1
+# 运行器异常退出后恢复；正常投递或受控终态退出码为 0。
+Restart=on-failure
+RestartSec=30s
+# 停止时清理本服务的进程，给状态保存留出收尾时间。
+KillMode=control-group
+TimeoutStopSec=15s
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# 由 register 启用实例，完成后禁用；不改变用户的 linger 设置。
+WantedBy=default.target

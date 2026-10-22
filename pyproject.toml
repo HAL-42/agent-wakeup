@@ -1,0 +1,29 @@
+[project]
+name = "agent-wakeup"
+version = "0.1.0"
+description = "Run condition probes in the background and wake an agent when there is work to do."
+readme = "README.md"
+requires-python = ">=3.15"
+license = "Apache-2.0"
+dependencies = ["jsonschema>=4.23", "loguru>=0.7"]
+
+[project.scripts]
+agent-wakeup = "agent_wakeup.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.11"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py315"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]

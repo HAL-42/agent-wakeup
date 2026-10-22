@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Probe result",
+  "type": "object",
+  "required": ["state", "summary"],
+  "additionalProperties": false,
+  "properties": {
+    "state": {
+      "type": "string",
+      "enum": ["wait", "wake"],
+      "description": "wait：继续检查；wake：投递 summary 后结束监控。"
+    },
+    "summary": {
+      "type": "string",
+      "description": "给 agent 的 prompt。wait 时只记录，wake 时原样投递。"
+    }
+  },
+  "if": {"properties": {"state": {"const": "wake"}}},
+  "then": {"properties": {"summary": {"minLength": 1}}}
+}
