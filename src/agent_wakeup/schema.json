@@ -7,14 +7,14 @@
   "properties": {
     "state": {
       "type": "string",
-      "enum": ["wait", "wake"],
-      "description": "wait：继续检查；wake：投递 summary 后结束监控。"
+      "enum": ["wait", "notify", "wake"],
+      "description": "wait：继续检查；notify：投递 summary 后继续检查；wake：投递 summary 后结束监控。"
     },
     "summary": {
       "type": "string",
-      "description": "给 agent 的 prompt。wait 时只记录，wake 时原样投递。"
+      "description": "给 agent 的 prompt。wait 时只记录，notify 和 wake 时原样投递。"
     }
   },
-  "if": {"properties": {"state": {"const": "wake"}}},
+  "if": {"properties": {"state": {"enum": ["notify", "wake"]}}},
   "then": {"properties": {"summary": {"minLength": 1}}}
 }

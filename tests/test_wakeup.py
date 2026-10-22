@@ -7,6 +7,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from textwrap import dedent
 from uuid import uuid4
 
 import pytest
@@ -93,6 +94,20 @@ def arm(
     return service.register(store, manager, **options)["watch_id"]
 
 
+def sequenced_probe(results: list[dict[str, str]]) -> str:
+    """Build a probe that advances through results using its own local file."""
+    return dedent(f"""\
+        import json
+        from pathlib import Path
+
+        results = {results!r}
+        counter = Path('probe-count')
+        index = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(index + 1))
+        print(json.dumps(results[index]))
+        """)
+
+
 def test_wait_then_wake_preserves_prompt_and_snapshot(
     context: tuple[Store, FakeSystemd, Path, Path],
 ) -> None:
@@ -115,6 +130,121 @@ def test_wait_then_wake_preserves_prompt_and_snapshot(
     run_watch(store, watch_id, manager, threading.Event())
     assert len(receipts.read_text().splitlines()) == 1
     assert ("disable", store.config(watch_id).unit) in manager.calls
+
+
+def test_notifications_continue_until_wake(
+    context: tuple[Store, FakeSystemd, Path, Path],
+) -> None:
+    """Each notify sends its literal prompt, including repeats, before the final wake."""
+    store, manager, _, receipts = context
+    first = '第一阶段完成。\n请分析 "结果"，保留 $(literal)。'
+    second = "第二阶段完成，请继续分析。"
+    final = "全部完成。"
+    watch_id = arm(
+        context,
+        sequenced_probe(
+            [
+                {"state": "wait", "summary": "任务启动"},
+                {"state": "notify", "summary": first},
+                {"state": "wait", "summary": "第二阶段运行中"},
+                {"state": "notify", "summary": first},
+                {"state": "notify", "summary": second},
+                {"state": "wake", "summary": final},
+            ]
+        ),
+    )
+    run_watch(store, watch_id, manager, threading.Event())
+    state = store.state(watch_id)
+    messages = [json.loads(line)["message"] for line in receipts.read_text().splitlines()]
+    assert messages == [first, first, second, final]
+    assert (state.phase, state.checks, state.delivery_attempts) == ("queued", 6, 4)
+    assert state.reason == "probe"
+    assert manager.calls.count(("disable", store.config(watch_id).unit)) == 1
+
+
+@pytest.mark.parametrize("failure", ["missing", "no_ack"])
+def test_notification_retry_resumes_monitoring(
+    context: tuple[Store, FakeSystemd, Path, Path], failure: str
+) -> None:
+    """A failed notification pauses checks; retry sends the saved prompt then resumes."""
+    store, manager, queue, receipts = context
+    watch_id = arm(
+        context,
+        sequenced_probe(
+            [
+                {"state": "notify", "summary": "分析阶段结果"},
+                {"state": "wake", "summary": "处理最终结果"},
+            ]
+        ),
+    )
+    healthy_queue = queue.read_bytes()
+    if failure == "missing":
+        queue.unlink()
+    else:
+        queue.write_text(f"#!{sys.executable}\nprint('no confirmed receipt')\n")
+    run_watch(store, watch_id, manager, threading.Event())
+    state = store.state(watch_id)
+    assert state.phase == ("delivery_failed" if failure == "missing" else "delivery_unknown")
+    assert (state.checks, state.delivery_attempts, state.summary) == (1, 1, "分析阶段结果")
+
+    queue.write_bytes(healthy_queue)
+    queue.chmod(0o700)
+    run_watch(store, watch_id, manager, threading.Event())
+    assert store.state(watch_id).checks == 1
+    assert not receipts.exists()
+
+    service.retry_delivery(store, manager, watch_id)
+    run_watch(store, watch_id, manager, threading.Event())
+    state = store.state(watch_id)
+    assert (state.phase, state.checks, state.delivery_attempts) == ("queued", 2, 3)
+    assert [json.loads(line)["message"] for line in receipts.read_text().splitlines()] == [
+        "分析阶段结果",
+        "处理最终结果",
+    ]
+
+
+def test_notification_keeps_deadline(context: tuple[Store, FakeSystemd, Path, Path]) -> None:
+    """Notifying does not extend the deadline or turn its final message into a notification."""
+    store, manager, _, receipts = context
+    watch_id = arm(
+        context,
+        'print(\'{"state":"notify","summary":"请检查任务状态"}\')',
+        interval_sec=5,
+        max_wait_sec=1,
+    )
+    deadline = store.config(watch_id).deadline
+    run_watch(store, watch_id, manager, threading.Event())
+    state = store.state(watch_id)
+    assert (state.phase, state.reason, state.checks) == ("queued", "deadline", 1)
+    assert store.config(watch_id).deadline == deadline
+    messages = [json.loads(line)["message"] for line in receipts.read_text().splitlines()]
+    assert len(messages) == 2
+    assert messages[0] == "请检查任务状态"
+    assert "等待期限" in messages[1]
+
+
+def test_probe_error_after_notification_finishes(
+    context: tuple[Store, FakeSystemd, Path, Path],
+) -> None:
+    """The error limit still ends monitoring after earlier intermediate notifications."""
+    store, manager, _, receipts = context
+    watch_id = arm(
+        context,
+        sequenced_probe(
+            [
+                {"state": "notify", "summary": "中间结果"},
+                {"state": "invalid", "summary": "无效输出"},
+            ]
+        ),
+        max_probe_errors=1,
+    )
+    run_watch(store, watch_id, manager, threading.Event())
+    state = store.state(watch_id)
+    assert (state.phase, state.reason, state.checks) == ("queued", "probe_error", 2)
+    messages = [json.loads(line)["message"] for line in receipts.read_text().splitlines()]
+    assert len(messages) == 2
+    assert messages[0] == "中间结果"
+    assert "连续检查失败" in messages[1]
 
 
 @pytest.mark.parametrize(
@@ -150,35 +280,44 @@ def test_deadline_survives_restart(context: tuple[Store, FakeSystemd, Path, Path
     assert "等待期限" in json.loads(receipts.read_text())["message"]
 
 
+@pytest.mark.parametrize("reason", ["", "probe_notify"])
 def test_interrupted_delivery_is_not_replayed(
-    context: tuple[Store, FakeSystemd, Path, Path],
+    context: tuple[Store, FakeSystemd, Path, Path], reason: str
 ) -> None:
     """A persisted sending state is ambiguous after a runner crash."""
     store, manager, _, receipts = context
-    watch_id = arm(context, "raise AssertionError('must not run')")
+    watch_id = arm(
+        context,
+        'print(\'{"state":"wake","summary":"finished"}\')'
+        if reason == "probe_notify"
+        else "raise AssertionError('must not run')",
+    )
     with store.edit(watch_id) as state:
-        state.phase, state.summary = "sending", "saved prompt"
+        state.phase, state.summary, state.reason = "sending", "saved prompt", reason
     run_watch(store, watch_id, manager, threading.Event())
     assert store.state(watch_id).phase == "delivery_unknown"
     assert not receipts.exists()
     service.retry_delivery(store, manager, watch_id)
     run_watch(store, watch_id, manager, threading.Event())
     assert store.state(watch_id).phase == "queued"
-    assert store.state(watch_id).checks == 0
-    assert json.loads(receipts.read_text())["message"] == "saved prompt"
+    assert store.state(watch_id).checks == (1 if reason == "probe_notify" else 0)
+    assert [json.loads(line)["message"] for line in receipts.read_text().splitlines()] == (
+        ["saved prompt", "finished"] if reason == "probe_notify" else ["saved prompt"]
+    )
     with pytest.raises(WakeupError):
         service.retry_delivery(store, manager, watch_id)
 
 
 @pytest.mark.parametrize("env", [{"QUEUE_SLEEP": "1"}, {"QUEUE_BAD_ACK": "1"}])
+@pytest.mark.parametrize("probe_state", ["wake", "notify"])
 def test_uncertain_receipt_stops_without_retry(
-    context: tuple[Store, FakeSystemd, Path, Path], env: dict[str, str]
+    context: tuple[Store, FakeSystemd, Path, Path], env: dict[str, str], probe_state: str
 ) -> None:
     """Timeout and malformed receipts never cause an automatic duplicate."""
     store, manager, _, receipts = context
     watch_id = arm(
         context,
-        'print(\'{"state":"wake","summary":"go"}\')',
+        sequenced_probe([{"state": probe_state, "summary": "go"}]),
         env={"RECEIPTS": str(receipts)} | env,
         queue_timeout_sec=0.2,
     )
@@ -229,9 +368,11 @@ def test_cancel_remove_keeps_original(context: tuple[Store, FakeSystemd, Path, P
     [
         {"state": "other", "summary": "x"},
         {"state": "wake", "summary": ""},
+        {"state": "notify", "summary": ""},
         {"state": "wait"},
         {"state": "wait", "summary": 1},
         {"state": "wake", "summary": "x", "extra": True},
+        {"state": "notify", "summary": "x", "event_id": "stage-1"},
     ],
 )
 def test_schema_contract(value: dict[str, object]) -> None:
@@ -279,11 +420,13 @@ def test_output_limit(tmp_path: Path) -> None:
     assert (tmp_path / "out").stat().st_size == 65536
 
 
-def test_cli_check_forwards_literal_arguments(tmp_path: Path) -> None:
-    """The optional check command reports wake without registering a watch."""
+@pytest.mark.parametrize("probe_state", ["wake", "notify"])
+def test_cli_check_forwards_literal_arguments(tmp_path: Path, probe_state: str) -> None:
+    """The optional check command reports results without registering or sending messages."""
     probe = tmp_path / "probe.py"
     probe.write_text(
-        "import json, sys\nprint(json.dumps({'state': 'wake', 'summary': sys.argv[1]}))\n"
+        "import json, sys\n"
+        + f"print(json.dumps({{'state': {probe_state!r}, 'summary': sys.argv[1]}}))\n"
     )
     message = '参数含空格、引号 " 与 $(literal)'
     result = subprocess.run(
@@ -304,7 +447,7 @@ def test_cli_check_forwards_literal_arguments(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
     )
-    assert json.loads(result.stdout)["result"] == {"state": "wake", "summary": message}
+    assert json.loads(result.stdout)["result"] == {"state": probe_state, "summary": message}
     assert not (tmp_path / "state").exists()
 
 

@@ -1,6 +1,6 @@
 # 架构与运行流程
 
-一次监控连接着 Agent 的两个轮次：前一个轮次安排等待，后一个轮次处理结果。两轮之间可能相隔几小时甚至几天，因此，检查条件、目标会话和运行进度都需要交给能够独立运行的后台进程保存和处理。
+一次监控可以跨越 Agent 的多个轮次：初次安排等待，运行期间处理阶段结果，最后处理最终结果。这些轮次之间可能相隔几小时甚至几天，因此，检查条件、目标会话和运行进度都需要交给能够独立运行的后台进程保存和处理。
 
 基础用法见 [SKILL.md](../SKILL.md)。本文介绍各模块如何配合，以及一项监控从注册到结束的完整过程。
 
@@ -24,8 +24,8 @@ flowchart TB
 | 模块 | 职责 |
 | --- | --- |
 | 命令行入口 | 接收注册和管理请求，保存监控配置，并控制对应的用户服务。Agent 通过这个入口安排后续等待。 |
-| <u>probe</u> | 执行与具体任务有关的查询，判断是否需要唤醒 Agent，并组织后续消息。不同业务可以使用各自的脚本。 |
-| 后台运行器 | 按计划执行 probe，处理检查结果，决定何时发送消息，并保存运行进度。每项监控有自己的运行器进程。 |
+| <u>probe</u> | 执行与具体任务有关的查询，决定何时通知 Agent、是否结束监控，并组织消息。通知频率和重复提醒由脚本自己控制。 |
+| 后台运行器 | 按计划执行 probe，保存检查结果，并根据脚本的返回值发送消息、继续检查或结束监控。每项监控有自己的运行器进程。 |
 | <u>systemd</u> 用户管理器 | 启动、停止监控进程，并在进程异常退出时按服务配置尝试重启。它让监控的生命周期独立于发起注册的命令。 |
 | Codex 消息发送模块 | 使用已保存的会话信息调用 `codex queue`，并把投递回执或错误交给运行器记录。 |
 | 本地监控记录 | 保存配置、probe 副本、当前进度、最近输出和投递结果。命令行工具与运行器通过这些记录共享信息。 |
@@ -44,13 +44,16 @@ flowchart TD
     D --> E[返回监控 ID，Agent 结束当前轮次]
     D --> F[运行器按计划执行检查]
     F --> G{probe 的结果}
-    G -->|wait| H[等待下次检查]
+    G -->|wait| H[按原计划等待下次检查]
     H --> F
-    G -->|wake| I[保存待发送的消息]
+    G -->|notify 或 wake| I[保存消息及其类型]
     F -->|到期或连续检查失败| I
     I --> J[调用 codex queue]
     J -->|消息被接受| K[原会话处理消息并继续工作]
-    J --> L[保存投递结果并结束监控]
+    J -->|notify 入队成功| H
+    J -->|wake 入队成功| L[结束监控]
+    J -->|失败或结果不明| M[保存结果并暂停监控]
+    M -->|retry_delivery| J
 ```
 
 ### 注册与会话绑定
@@ -65,15 +68,21 @@ flowchart TD
 
 新注册的监控会先执行一次 probe。之后的检查间隔从上一次有效检查结束时开始计算。同一项监控的检查按顺序执行，因此某次查询较慢时，下一次检查也会相应推迟。
 
-probe 返回 `wait` 时，运行器保存最近结果并等待下一次检查。返回 `wake` 时，运行器把 `summary` 保存为待发送的消息，随后进入发送阶段。probe 负责解释业务结果；例如，外部任务失败时，也可以返回 `wake`，让 Agent 根据消息处理失败。
+probe 返回 `wait` 时，运行器保存最近结果并等待下一次检查。返回 `notify` 或 `wake` 时，运行器把 `summary` 保存为待发送的消息，同时记录这次发送之后应继续检查还是结束监控。这样，即使发送需要重试，运行器也能恢复正确的后续行为。
 
-总等待期限和连续检查错误由运行器处理。到达期限，或脚本连续执行失败达到设定次数时，运行器会生成一条说明原因的消息，让 Agent 决定后续处理。相关参数及错误计数规则见 `register --help`。
+probe 根据业务情况选择消息类型。需要 Agent 查看运行状态或处理阶段结果时，可以返回 `notify`。全部完成或发生需要结束监控的业务失败时，可以返回 `wake`，并在消息中说明后续工作。
+
+总等待期限和连续检查错误由运行器处理。到达期限，或脚本连续执行失败达到设定次数时，运行器会生成一条用于结束监控的消息，说明原因并让 Agent 决定后续处理。相关参数及错误计数规则见 `register --help`。
 
 ### 消息发送与监控结束
 
-运行器把已保存的消息交给发送模块，再由发送模块调用 `codex queue`。收到明确的接受回执后，运行器保存消息 ID，将监控状态记为 `queued`，然后禁用服务实例并退出。后续工作由原会话执行。
+运行器把已保存的消息交给发送模块，再由发送模块调用 `codex queue`。收到明确的接受回执后，运行器会把消息 ID 和后续运行状态一起保存。
 
-消息发送失败或结果无法确认时，运行器会保存命令输出和相应状态，结束本次监控。对于无法确认的投递，可以结合记录与目标会话判断是否需要再次发送。`retry_delivery` 使用已保存的消息和会话配置继续处理，具体适用状态见该命令的帮助。
+对于 `notify`，监控回到 `waiting`，服务继续运行，并按原计划执行下一次检查。消息入队后即可继续检查，无需等待 Agent 处理完消息。通知不会延长总等待期限。
+
+对于 `wake`，监控进入 `queued`，随后禁用服务实例并退出。用于结束监控的超时或检查错误消息也按这个流程处理，后续工作由原会话执行。
+
+消息发送失败或结果无法确认时，运行器保留待发送消息和命令输出，暂停监控。`retry_delivery` 会先重新发送保存的消息：中间通知成功后恢复检查，最终唤醒成功后结束监控。重试继续使用原来的总等待期限，具体用法见该命令的帮助。
 
 ### 运行记录与进程恢复
 
@@ -82,3 +91,70 @@ probe 返回 `wait` 时，运行器保存最近结果并等待下一次检查。
 每项监控都有独立的记录目录，默认位于 `~/.local/state/agent-wakeup/` 下；设置了 `XDG_STATE_HOME` 时使用其中的 `agent-wakeup/`，也可通过 `--state_dir` 指定。`status` 会返回该监控的实际目录，便于查看配置、输出和投递结果。
 
 监控结束后记录继续保留。`remove` 用于清理这些本地记录，原始 probe 脚本和外部任务产物继续由使用者管理。共享的服务模板保留供其他监控使用，journal 日志由系统管理。
+
+## 控制通知时机
+
+每次返回 `notify` 都会请求发送一条消息。probe 可以用自己的文件记录提醒时间或已通知的阶段，让这些信息在多次脚本执行之间保留下来。
+
+下面两个例子都假设任务有一个可写目录 `/data/run-42`，并用其中的 `finished` 文件表示任务全部完成。实际使用时，可以将文件判断替换成平台状态查询。保存提醒记录的文件应由这项监控单独使用。
+
+### 定期请 Agent 检查运行状态
+
+有些判断需要 Agent 结合日志完成。probe 可以在开始监控时请求一次检查，之后每隔至少一小时再次提醒。它把最近一次请求的时间写入文件，其余时间返回 `wait`。任务完成时，返回 `wake` 让 Agent 处理最终结果。
+
+```python
+import json
+import time
+from pathlib import Path
+
+task_dir = Path("/data/run-42")
+reminder_file = task_dir / "last-reminder.txt"
+now = time.time()
+last_reminder = float(reminder_file.read_text()) if reminder_file.exists() else 0.0
+
+if (task_dir / "finished").is_file():
+    result = {"state": "wake", "summary": "任务已完成，请分析 /data/run-42 的最终结果。"}
+elif now - last_reminder >= 3600:
+    reminder_file.write_text(str(now))
+    result = {
+        "state": "notify",
+        "summary": "请检查 /data/run-42/train.log，判断训练是否正常。后台监控仍在运行。",
+    }
+else:
+    result = {"state": "wait", "summary": "等待任务完成或下一次提醒。"}
+
+print(json.dumps(result, ensure_ascii=False))
+```
+
+### 在阶段完成后通知一次
+
+多阶段任务可以为每个完成的阶段生成一个标记文件，例如 `stage-1.done`。probe 保存已请求通知的阶段名称，发现新完成的阶段时，将它们放进一条消息。下次检查仍能看到相同标记文件时，脚本会继续等待其他阶段。
+
+```python
+import json
+from pathlib import Path
+
+task_dir = Path("/data/run-42")
+record_file = task_dir / "notified-stages.json"
+notified = set(json.loads(record_file.read_text())) if record_file.exists() else set()
+completed = {path.stem for path in task_dir.glob("stage-*.done")}
+new_stages = sorted(completed - notified)
+
+if (task_dir / "finished").is_file():
+    result = {
+        "state": "wake",
+        "summary": "全部阶段已完成，请分析并汇总 /data/run-42 的各阶段结果。",
+    }
+elif new_stages:
+    record_file.write_text(json.dumps(sorted(notified | set(new_stages))))
+    result = {
+        "state": "notify",
+        "summary": f"阶段 {', '.join(new_stages)} 已完成，请分析 /data/run-42 中对应的结果。后续阶段仍在监控中。",
+    }
+else:
+    result = {"state": "wait", "summary": "等待其他阶段完成。"}
+
+print(json.dumps(result, ensure_ascii=False))
+```
+
+这些文件记录的是 probe 已提出的通知请求。实际发送由运行器负责；投递失败后，运行器保留原消息，供 `retry_delivery` 继续发送。

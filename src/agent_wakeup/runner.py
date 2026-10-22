@@ -1,4 +1,4 @@
-"""Deterministic polling and one-shot agent delivery."""
+"""Deterministic polling with intermediate notifications and final wakeups."""
 
 import subprocess
 import threading
@@ -36,7 +36,7 @@ def deliver(store: Store, config: Config, stopped: threading.Event) -> None:
         state.last_error = receipt.error
         if receipt.phase == "queued":
             state.phase, state.queued_message_id, state.queued_at = (
-                "queued",
+                "waiting" if state.reason == "probe_notify" else "queued",
                 receipt.message_id,
                 time.time(),
             )
@@ -98,9 +98,10 @@ def poll_once(store: Store, config: Config, stopped: threading.Event) -> None:
             state.summary = result_value["summary"]
             state.consecutive_errors, state.last_error = 0, ""
             state.next_check_at = now + config.interval_sec
-            if result_value["state"] == "wake":
-                state.phase, state.reason = "triggered", "probe"
-                logger.info("{} probe triggered", config.watch_id)
+            if result_value["state"] in {"notify", "wake"}:
+                state.phase = "triggered"
+                state.reason = "probe_notify" if result_value["state"] == "notify" else "probe"
+                logger.info("{} probe triggered: {}", config.watch_id, result_value["state"])
 
 
 def run_watch(store: Store, watch_id: str, manager: Systemd, stopped: threading.Event) -> None:

@@ -65,6 +65,7 @@ def parser() -> argparse.ArgumentParser:
             Agent 编写一个每次只检查一次条件的 probe，再用 register 注册监控。
             运行器通过 systemd 用户服务定期执行 probe；需要唤醒时，将 probe 返回的
             summary 通过 codex queue 发送到目标会话。等待期间的轮询无需调用模型。
+            probe 可选择发送中间通知后继续监控，或在最终唤醒后结束监控。
             """),
         epilog=dedent("""\
             从本地项目目录开始：
@@ -90,8 +91,13 @@ def parser() -> argparse.ArgumentParser:
             命令会保存脚本副本、运行参数和目标会话，准备 systemd 用户服务并启动运行器。
             返回结果包括 watch_id、key、服务名称、当前状态和记录目录。
 
-            运行器启动后先检查一次。probe 返回 wait 时继续等待，返回 wake 时将
-            summary 原样发送到目标会话。消息被接受后，监控结束，记录保留。
+            新监控启动后先检查一次。probe 的 state 决定本次如何处理：
+              wait    保存检查结果，等待下一次检查。
+              notify  原样发送 summary，消息入队成功后继续检查。
+              wake    原样发送 summary，消息入队成功后结束监控。
+
+            每次返回 notify 都会发送一条消息，通知频率和重复提醒由 probe 自己控制。
+            通知成功后按原计划检查，无需等待 Agent 处理完消息，总等待期限也保持不变。
 
             同一会话中，相同 key 和相同配置会复用原监控，输出 reused=true。
             已结束的记录也会被复用；开始新一轮监控，或更换脚本、参数时，使用新的 key。
@@ -114,7 +120,8 @@ def parser() -> argparse.ArgumentParser:
             成功时返回 probe 的 state、summary、运行耗时，以及写入 stderr 的诊断信息。
 
             这是一次性的脚本检查。它不注册监控或启动后台服务，也不会向会话发送消息。
-            因此，即使结果为 wake，也只会显示检查结果。可按需要用它调试 probe。
+            wait、notify 和 wake 三种结果都会直接显示，检查完成后命令退出。
+            可按需要用它调试 probe。
             """,
             """\
             示例：
@@ -148,6 +155,9 @@ def parser() -> argparse.ArgumentParser:
             列出所选状态目录中的全部监控，包括正在等待的监控和已经结束的记录。
             每项结果包含 watch_id、key、目标会话、当前状态和最近一次检查的摘要。
 
+            已发送过中间通知的监控可以继续处于 waiting 状态。
+            状态和投递回执的含义见 status --help。
+
             可以先用本命令找到监控 ID，再交给 status 查看详情，或交给 cancel、remove
             等命令管理。这里只读取本地记录，不会重新执行 probe 或查询外部任务。
             """,
@@ -165,7 +175,9 @@ def parser() -> argparse.ArgumentParser:
             最近错误和消息投递回执。它用于了解监控进展，不会发起新的 probe 检查。
 
             输出中的 directory 是该监控的记录目录，可在其中查看保存的 probe 输出
-            和各次投递命令的输出。queued_message_id 是 Codex 确认接受消息后返回的 ID。
+            和各次投递命令的输出。queued_message_id 和 queued_at 记录最近一次成功
+            投递的消息 ID 和时间。监控处于 waiting 时，也可能已经发送过中间通知。
+            当 reason 为 probe_notify 时，当前或最近一次投递属于中间通知。
             """,
             """\
             示例：
@@ -176,10 +188,10 @@ def parser() -> argparse.ArgumentParser:
               waiting           正在检查条件，或等待下一次检查。
               triggered         唤醒消息已保存，准备发送。
               sending           正在执行消息投递命令。
-              queued            Codex 已确认接受消息；后续工作由目标会话执行。
+              queued            用于结束监控的消息已被接受，监控结束。
               cancelled         监控已被取消，记录保留。
-              delivery_failed   投递命令未能启动，可排除原因后重新发送。
-              delivery_unknown  无法确认投递结果，需要结合日志和目标会话判断。
+              delivery_failed   投递命令未能启动，监控已暂停，可排除原因后重试。
+              delivery_unknown  无法确认投递结果，监控已暂停，需要结合日志和目标会话判断。
             """,
         ),
         "cancel": (
@@ -203,7 +215,9 @@ def parser() -> argparse.ArgumentParser:
             """\
             用于状态为 delivery_failed 或 delivery_unknown 的监控。
             命令会重新启动服务，把已保存的 summary 发送到原来的目标会话。
-            它沿用原来的消息内容和连接配置，不重新运行 probe，也不重新开始等待。
+            它沿用原来的消息内容和连接配置，先重新发送消息，再按消息类型继续：
+              notify  入队成功后恢复检查，沿用原来的检查计划和总等待期限。
+              wake    入队成功后结束监控。
 
             delivery_unknown 表示缺少明确回执，消息可能已经到达。
             结合 status 中的记录和目标会话，判断是否需要再次发送。

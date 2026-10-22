@@ -7,6 +7,7 @@ import threading
 import time
 import typing as t
 from pathlib import Path
+from textwrap import dedent
 from uuid import uuid4
 
 import pytest
@@ -42,11 +43,23 @@ def cleanup(store: Store, manager: Systemd) -> None:
 
 
 def test_systemd_restart_delivery_and_cleanup(tmp_path: Path) -> None:
-    """A restarted real service resumes polling and disables itself after delivery."""
+    """Notifications keep the service alive; restart resumes checks until the final wake."""
     store, manager = Store(tmp_path / "state"), Systemd()
     probe = tmp_path / "probe.py"
     probe.write_text(
-        "import json\nfrom pathlib import Path\nprint(json.dumps({'state': 'wake' if Path('ready').exists() else 'wait', 'summary': 'live systemd result'}))\n"
+        dedent("""\
+        import json
+        from pathlib import Path
+
+        if Path('ready').exists():
+            result = {'state': 'wake', 'summary': 'live systemd result'}
+        elif Path('notify').exists():
+            Path('notify').unlink()
+            result = {'state': 'notify', 'summary': 'intermediate result'}
+        else:
+            result = {'state': 'wait', 'summary': 'waiting'}
+        print(json.dumps(result))
+        """)
     )
     queue = tmp_path / "codex"
     queue.write_text(
@@ -76,14 +89,37 @@ def test_systemd_restart_delivery_and_cleanup(tmp_path: Path) -> None:
         config = store.config(watch_id)
         until(lambda: store.state(watch_id).checks >= 1)
         assert not (tmp_path / "receipt").exists()
+        original_pid = manager.control("show", config.unit, "--property=MainPID", "--value")
+        (tmp_path / "notify").touch()
+        until(
+            lambda: (
+                store.state(watch_id).queued_message_id == "live-test"
+                and store.state(watch_id).phase == "waiting"
+            )
+        )
+        assert manager.status(config.unit)["ActiveState"] == "active"
+        assert manager.status(config.unit)["UnitFileState"] == "enabled"
+        assert manager.control("show", config.unit, "--property=MainPID", "--value") == original_pid
+        assert (tmp_path / "receipt").read_text().splitlines() == ["intermediate result"]
+        state = store.state(watch_id)
+        assert state.last_check_at is not None
+        assert state.next_check_at - state.last_check_at == pytest.approx(
+            config.interval_sec, abs=1e-6
+        )
+        original_checks = state.checks
         original_start = store.state(watch_id).started_at
         manager.control("restart", config.unit)
         until(lambda: store.state(watch_id).started_at != original_start)
+        until(lambda: store.state(watch_id).checks > original_checks)
+        assert (tmp_path / "receipt").read_text().splitlines() == ["intermediate result"]
         assert store.config(watch_id).deadline == config.deadline
         (tmp_path / "ready").touch()
         until(lambda: store.state(watch_id).phase == "queued")
         until(lambda: manager.status(config.unit)["ActiveState"] == "inactive")
-        assert (tmp_path / "receipt").read_text().splitlines() == ["live systemd result"]
+        assert (tmp_path / "receipt").read_text().splitlines() == [
+            "intermediate result",
+            "live systemd result",
+        ]
         assert manager.status(config.unit)["UnitFileState"] == "disabled"
         service.remove(store, manager, watch_id)
         assert probe.exists()
@@ -96,15 +132,30 @@ def test_systemd_restart_delivery_and_cleanup(tmp_path: Path) -> None:
             manager.control("daemon-reload")
 
 
-def test_systemd_cancel_active_probe(tmp_path: Path) -> None:
+@pytest.mark.parametrize("notify_first", [False, True])
+def test_systemd_cancel_active_probe(tmp_path: Path, notify_first: bool) -> None:
     """Cancelling an active service also stops the probe's child process."""
     store, manager = Store(tmp_path / "state"), Systemd()
     probe = tmp_path / "probe.py"
     probe.write_text(
-        "import subprocess, sys, time\nfrom pathlib import Path\n"
+        "import json, subprocess, sys, time\nfrom pathlib import Path\n"
+        + (
+            "if not Path('notified').exists():\n"
+            + "    Path('notified').touch()\n"
+            + "    print(json.dumps({'state': 'notify', 'summary': 'intermediate result'}))\n"
+            + "    sys.exit(0)\n"
+            if notify_first
+            else ""
+        )
         + "subprocess.Popen([sys.executable, '-c', \"import time; from pathlib import Path; time.sleep(2); Path('leaked').touch()\"])\n"
         + "Path('running').touch()\ntime.sleep(60)\n"
     )
+    queue = tmp_path / "codex"
+    queue.write_text(
+        f"#!{sys.executable}\nimport sys\n"
+        + "print('Queued message cancel-test for thread ' + sys.argv[sys.argv.index('--thread') + 1] + '.')\n"
+    )
+    queue.chmod(0o700)
     watch_id = None
     try:
         registered = service.register(
@@ -117,8 +168,9 @@ def test_systemd_cancel_active_probe(tmp_path: Path) -> None:
             cwd=tmp_path,
             env={},
             thread_id=str(uuid4()),
-            codex_binary="/usr/bin/false",
+            codex_binary=str(queue),
             codex_home=tmp_path,
+            interval_sec=0.2,
             max_wait_sec=60,
         )
         watch_id = registered["watch_id"]
@@ -126,6 +178,7 @@ def test_systemd_cancel_active_probe(tmp_path: Path) -> None:
         until(lambda: (tmp_path / "running").exists())
         service.cancel(store, manager, watch_id)
         assert store.state(watch_id).phase == "cancelled"
+        assert store.state(watch_id).delivery_attempts == (1 if notify_first else 0)
         assert manager.status(config.unit)["ActiveState"] == "inactive"
         threading.Event().wait(2.1)
         assert not (tmp_path / "leaked").exists()
