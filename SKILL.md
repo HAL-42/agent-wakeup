@@ -2,127 +2,84 @@
 name: agent-wakeup
 description: >
   仅在用户或上下文明确要求使用本 skill 时调用。
-  注册后台条件检查，在条件满足后向指定 agent 会话投递消息。
+  为需要等待外部条件的工作安排后台检查，条件满足后唤醒原会话继续执行。
 ---
 
 # Agent Wakeup
 
-当后续工作需要等待外部条件时，将条件检查交给后台进程。Agent 注册监控后结束当前轮次，条件满足时由后台消息唤醒原会话，继续后续工作。等待期间的轮询无需调用模型。
+## 为什么使用
 
-项目同时提供 skill 和命令行工具。当前使用 Linux <u>systemd</u> 用户服务托管监控，通过 `codex queue` 投递消息。
+Agent 完成一项工作时，常常需要等待外部任务或资源。例如，模型转换可能持续几个小时，训练可能持续几天；下载产物、检查结果、更新配置等后续工作，都要等它们结束后才能进行。等待期间，下一步往往已经明确，缺少的只是继续执行的时机。
 
-## 基础用法
+让 Agent 反复查询进度，会在等待中持续消耗模型 token。结束当前轮次可以停下这些调用，但外部条件满足后，还需要有人回来提醒它继续。
 
-需要 [uv](https://docs.astral.sh/uv/getting-started/installation/)、可用的 systemd 用户服务，以及支持 `queue` 的 Codex CLI。Python 和项目依赖由 uv 管理。
+agent-wakeup 将这段等待交给普通的后台进程，并在需要继续工作时自动唤醒原会话。它适合这样的工作：**已经知道下一步要做什么，但必须先等待一个能够用脚本判断的条件。** 这个条件可以是任务成功或失败、文件已经生成，或者远端服务进入指定状态。
 
-将项目放在所需的 skill 目录中，通过目录内的入口脚本调用：
+## 工作原理
 
-```bash
-git clone https://github.com/HAL-42/agent-wakeup.git
-cd agent-wakeup
-./agent-wakeup --help
+Agent 把判断条件写成一个 <u>probe</u>，也就是执行一次状态检查的脚本。每次运行后，probe 告诉运行器是继续等待，还是唤醒会话。如果需要唤醒，它还会提供一段消息，说明检查结果以及接下来要做的工作。
+
+项目中的后台运行器负责按间隔执行 probe。运行器由 Linux 的 <u>systemd</u> 用户服务管理，因此 Agent 可以在注册监控后结束当前轮次。等待期间的轮询由这些普通进程完成，无需调用模型。
+
+当前版本通过 `codex queue` 向 Codex 会话发送消息。注册监控时会保存目标会话及其 Codex 运行环境；条件满足后，运行器把 probe 提供的消息发送到这个会话。目标 Codex 服务需要保持运行，原会话需要保持加载，这样消息到达后就能自动开始下一轮。
+
+```mermaid
+flowchart TD
+    A[Agent 注册监控并结束本轮] --> B[后台运行器执行 probe]
+    B --> C{是否需要继续工作}
+    C -->|继续等待| D[等待下次检查]
+    D --> B
+    C -->|唤醒会话| E[通过 codex queue 发送消息]
+    E --> F[原会话开始下一轮]
 ```
 
-用户提供需要等待的条件和触发后的工作，例如：
+确认消息已被 Codex 接受后，运行器结束，服务实例自动禁用。监控记录和投递结果会保留，便于之后查看或清理。
 
-> 使用 agent-wakeup 等待 `/data/report.json` 生成，随后读取报告并解释结果。
+## 使用方法
+
+使用本地项目目录中的 `agent-wakeup` 入口脚本。运行环境需要 [uv](https://docs.astral.sh/uv/getting-started/installation/)、可用的 systemd 用户服务，以及支持 `queue` 的 Codex CLI。Python 和项目依赖由 uv 管理。
 
 ### 编写 probe
 
-<u>Probe</u> 是每次执行只检查一次条件的脚本，输出遵循 [JSON Schema](src/agent_wakeup/schema.json)。触发时，`summary` 会原样作为 prompt 发给 agent；将结果位置、必要的背景和后续指令写在其中，较长日志可引用文件路径。
-
-正常返回使用退出码 `0`，stdout 输出一个 JSON 对象，诊断写 stderr。例如：
+例如，用户希望等待 `/data/report.json` 生成，然后让 Agent 读取并解释报告。可以将下面的脚本保存为 `probe.py`：
 
 ```python
 import json
 from pathlib import Path
 
-ready = Path("/data/report.json").is_file()
-print(
-    json.dumps(
-        {
-            "state": "wake" if ready else "wait",
-            "summary": "报告已生成，请读取 /data/report.json 并解释结果。"
-            if ready
-            else "等待报告生成",
-        },
-        ensure_ascii=False,
-    )
-)
+if Path("/data/report.json").is_file():
+    result = {
+        "state": "wake",
+        "summary": "报告已生成。请读取 /data/report.json 并解释结果。",
+    }
+else:
+    result = {"state": "wait", "summary": "等待报告生成。"}
+
+print(json.dumps(result, ensure_ascii=False))
 ```
 
-### 注册并继续
+输出格式由 [JSON Schema](src/agent_wakeup/schema.json) 定义。`state` 为 `wait` 时继续等待，为 `wake` 时唤醒会话。唤醒时，`summary` 会原样作为 prompt 发送给 Agent，因此应在其中写清结果位置、必要的背景和后续指令。较长的日志可以通过文件路径引用。
 
-将脚本保存为 `probe.py`，在目标 Codex 会话中注册：
+脚本每次执行只检查一次条件，检查间隔由运行器安排。正常返回使用退出码 `0`，stdout 输出一个 JSON 对象，诊断信息写入 stderr。
+
+### 注册监控
+
+在目标 Codex 会话中调用本地入口脚本，将示例路径替换为实际路径：
 
 ```bash
-/absolute/path/agent-wakeup/agent-wakeup register \
-  --key report-ready --probe /absolute/path/probe.py
+/path/to/agent-wakeup/agent-wakeup register \
+  --key report-ready \
+  --probe /path/to/probe.py
 ```
 
-`register` 保存 probe 快照并绑定目标会话，默认取当前 `CODEX_THREAD_ID`，也可指定会话 UUID。首次注册自动生成所需的用户服务配置。
+`--key` 为这项监控指定一个便于识别的名称。`register` 默认绑定当前 `CODEX_THREAD_ID` 指定的会话，也可以用 `--thread_id` 指定另一个会话。首次注册会自动生成所需的 systemd 用户服务配置，并保存 probe 的副本用于后续检查。
 
-注册成功后，向用户报告监控 ID 并结束当前轮次。让目标 Codex 服务保持运行、原会话保持加载；收到消息后，根据其中的结果和指令继续工作。
+按具体任务选择检查间隔、总等待期限和单次检查超时。参数的作用、默认值和调用示例见 `agent-wakeup register --help`。
 
-按任务需要选择检查间隔、期限、解释器、工作目录和环境。具体参数见 `register --help`，其他管理命令见入口脚本的 `--help`。
+### 结束本轮，等待继续
 
-## 模块关系
+注册成功后，向用户报告返回的监控 ID，然后结束当前轮次。后台运行器会接管等待，条件满足后发送消息。收到消息时，根据其中的结果和指令继续原来的工作。
 
-```mermaid
-flowchart TB
-    A[Agent 会话] -->|明确调用| C[CLI]
-    S[SKILL.md] -.使用指引.-> A
-    C -->|注册与管理| M[systemd 用户管理器]
-    M -->|启动与恢复| R[runner]
-    R -->|执行一次| P[probe]
-    P -->|查询| E[文件、服务或外部任务]
-    P -->|state 和 summary| R
-    R <--> D[本地状态与结果]
-    R -->|条件触发| N[Codex 投递适配]
-    N -->|queue| A
-```
+需要查看进展时，用 `list` 找到监控 ID，再用 `status` 查看详细记录。需要提前结束等待时，用 `cancel` 停止监控。监控结束后，可以用 `remove` 清理保存的记录。
 
-probe 负责业务判断和组织 prompt；<u>runner</u> 是后台运行器，管理检查与投递；systemd 管理进程生命周期。其他 agent 可以通过增加投递适配接入。
-
-## 运行流程
-
-```mermaid
-flowchart TD
-    A[明确请求使用 skill] --> B[编写单次 probe]
-    B --> C[register 保存快照与会话绑定]
-    C --> D[启动服务并返回监控 ID]
-    D --> E[Agent 结束当前轮次]
-    D --> F[runner 执行 probe]
-    F --> G{state}
-    G -->|wait| H[等待下次检查]
-    H --> F
-    G -->|wake| I[保存待投递 prompt]
-    F -->|连续执行错误或到期| I
-    I --> J[codex queue]
-    J -->|确认接受| K[保存回执并结束服务]
-    J -->|未能确认| L[保留记录供处理]
-    K --> M[原会话收到消息并继续]
-```
-
-投递适配连接原会话所属的 Codex 环境。`queued` 表示已接受投递，后续执行发生在原会话中。
-
-## 运行记录与服务
-
-默认状态目录为 `${XDG_STATE_HOME:-~/.local/state}/agent-wakeup`，可用 `--state_dir` 指定。每个监控保存配置、probe 快照、最近输出和投递回执。环境覆盖保存在该用户的私有配置中。
-
-代码和 `.venv` 保留在项目目录。systemd 模板位于用户配置目录，按项目和状态目录区分；uv 路径在注册时检测。模板字段说明见[服务模板](src/agent_wakeup/systemd.service.in)。
-
-监控结束后 runner 退出，服务实例禁用，记录保留。通过 `status` 查看、`cancel` 停止监控、`remove` 清理已结束记录；原始脚本和外部产物由使用者管理。journal 历史由系统管理。
-
-`delivery_unknown` 保留了无法确认的投递。核对目标会话后，可用 `retry_delivery` 重新发送保存的 prompt。该操作不会重新执行 probe。
-
-服务使用当前用户的 systemd 管理器。项目保持已有 linger 设置；需要跨退出登录持续运行时，由使用者配置用户管理器的生命周期。
-
-## 开发
-
-```bash
-uv run --locked pytest
-uv run --locked ruff check .
-```
-
-依赖和解释器版本由仓库记录。项目采用 [Apache-2.0](LICENSE) 许可证。
+各命令的用途见本地入口脚本的 `--help`；执行 `<命令> --help` 可以查看详细说明和示例。

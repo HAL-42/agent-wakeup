@@ -14,6 +14,7 @@ import time
 import typing as t
 from dataclasses import asdict
 from pathlib import Path
+from textwrap import dedent
 
 from jsonschema import ValidationError
 from loguru import logger
@@ -56,110 +57,318 @@ def environment(values: list[str]) -> dict[str, str]:
 def parser() -> argparse.ArgumentParser:
     """Build help as the authoritative reference for command options."""
     root = argparse.ArgumentParser(
-        description="后台执行条件检查，在触发时向 agent 会话投递 prompt。",
-        epilog="首次 register 自动登记 systemd 用户服务。代码和环境留在本项目；状态保存在用户目录。",
+        prog="agent-wakeup",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=dedent("""\
+            让 Agent 把长时间等待交给后台进程，条件满足后自动回到原会话继续工作。
+
+            Agent 编写一个每次只检查一次条件的 probe，再用 register 注册监控。
+            运行器通过 systemd 用户服务定期执行 probe；需要唤醒时，将 probe 返回的
+            summary 通过 codex queue 发送到目标会话。等待期间的轮询无需调用模型。
+            """),
+        epilog=dedent("""\
+            从本地项目目录开始：
+              ./%(prog)s register --key report-ready --probe /path/to/probe.py
+              ./%(prog)s list
+              ./%(prog)s status <watch_id>
+
+            register 返回监控 ID 后，Agent 可以结束当前轮次。
+            保持目标 Codex 服务运行、原会话加载，后台消息到达后便可继续工作。
+
+            用法说明：
+              ./%(prog)s <命令> --help  查看该命令的详细行为、参数和示例。
+              每个命令都可用 --state_dir 选择记录目录，用 --json 输出单行 JSON。
+              首次 register 自动准备用户服务配置；Python 和依赖由 uv 管理。
+            """),
     )
-    commands = root.add_subparsers(dest="command", required=True)
+    commands = root.add_subparsers(dest="command", title="命令", metavar="COMMAND", required=True)
     descriptions = {
-        "register": "保存 probe 快照和会话绑定，启动后台监控；相同会话/key 的相同配置复用原实例。",
-        "check": "按给定环境执行一次 probe 并验证 JSON；即使返回 wake 也不投递。",
-        "doctor": "检查 uv、Codex 和 systemd 用户服务条件；不运行 probe 或发送消息。",
-        "list": "列出本状态目录的监控记录，不查询被监控的数据源。",
-        "status": "查看一个监控的最近结果、期限、错误、回执和 systemd 状态。",
-        "cancel": "停止监控及 probe 子进程，保留记录；外部任务和已入队消息不受影响。",
-        "retry_delivery": "核对原会话后，显式重投未确认/失败的 prompt；不重新运行 probe。",
-        "remove": "删除已结束监控的本地记录；运行中的监控先 cancel。",
-        "run": "内部入口：由 systemd 运行或恢复一个监控实例。",
+        "register": (
+            "保存 probe 和目标会话，启动后台监控，并返回可查询的监控 ID。",
+            """\
+            将一个 probe 注册为后台监控，供 Agent 结束当前轮次后继续等待条件。
+            命令会保存脚本副本、运行参数和目标会话，准备 systemd 用户服务并启动运行器。
+            返回结果包括 watch_id、key、服务名称、当前状态和记录目录。
+
+            运行器启动后先检查一次。probe 返回 wait 时继续等待，返回 wake 时将
+            summary 原样发送到目标会话。消息被接受后，监控结束，记录保留。
+
+            同一会话中，相同 key 和相同配置会复用原监控，输出 reused=true。
+            已结束的记录也会被复用；开始新一轮监控，或更换脚本、参数时，使用新的 key。
+            """,
+            """\
+            示例：
+              ./%(prog)s --key report-ready --probe /path/to/probe.py
+              ./%(prog)s --key export-ready --probe /path/to/probe.py --interval_sec 600
+              ./%(prog)s --key build-ready --probe /path/to/probe.sh --interpreter bash
+              ./%(prog)s --key job-ready --probe /path/to/probe.py -- --job_id example-123
+
+            -- 后面的参数原样交给 probe。其余选项应放在 -- 之前。
+            注册成功后报告 watch_id 并结束当前轮次，等待后台消息唤醒原会话。
+            """,
+        ),
+        "check": (
+            "执行一次 probe 并验证输出，供编写或调试检查脚本时使用。",
+            """\
+            使用指定的解释器、工作目录和环境变量运行一次 probe，检查退出码和 JSON 格式。
+            成功时返回 probe 的 state、summary、运行耗时，以及写入 stderr 的诊断信息。
+
+            这是一次性的脚本检查。它不注册监控或启动后台服务，也不会向会话发送消息。
+            因此，即使结果为 wake，也只会显示检查结果。可按需要用它调试 probe。
+            """,
+            """\
+            示例：
+              ./%(prog)s --probe /path/to/probe.py
+              ./%(prog)s --probe /path/to/probe.py --cwd /path/to/work --env API_URL=https://example.com
+              ./%(prog)s --probe /path/to/probe.py -- --job_id example-123
+
+            检查成功返回退出码 0；脚本执行失败、超时或输出不符合协议时返回 1。
+            probe 输出格式见项目中的 src/agent_wakeup/schema.json。
+            """,
+        ),
+        "doctor": (
+            "诊断本机是否具备运行条件，帮助定位命令或用户服务的环境问题。",
+            """\
+            检查 uv 和 Codex CLI 是否可用、Codex 是否支持 queue，以及能否连接
+            systemd 用户管理器。输出还会列出 Python 版本、项目路径、状态目录和
+            当前的 linger 设置，便于定位环境问题。
+
+            这是按需使用的诊断命令。它只报告检查结果，不运行 probe、发送消息或修改
+            系统配置。运行条件满足时返回退出码 0，存在缺失条件时返回 1。
+            """,
+            """\
+            示例：
+              ./%(prog)s
+              ./%(prog)s --json
+            """,
+        ),
+        "list": (
+            "列出保存的监控记录，查找监控 ID、目标会话和最近状态。",
+            """\
+            列出所选状态目录中的全部监控，包括正在等待的监控和已经结束的记录。
+            每项结果包含 watch_id、key、目标会话、当前状态和最近一次检查的摘要。
+
+            可以先用本命令找到监控 ID，再交给 status 查看详情，或交给 cancel、remove
+            等命令管理。这里只读取本地记录，不会重新执行 probe 或查询外部任务。
+            """,
+            """\
+            示例：
+              ./%(prog)s
+              ./%(prog)s --state_dir /path/to/wakeup-state --json
+            """,
+        ),
+        "status": (
+            "查看一个监控的检查结果、消息投递结果和 systemd 服务状态。",
+            """\
+            查看指定 watch_id 的详细记录，以及对应 systemd 服务的当前状态。
+            结果包括目标会话、脚本来源、工作目录、等待期限、检查次数、最近摘要、
+            最近错误和消息投递回执。它用于了解监控进展，不会发起新的 probe 检查。
+
+            输出中的 directory 是该监控的记录目录，可在其中查看保存的 probe 输出
+            和各次投递命令的输出。queued_message_id 是 Codex 确认接受消息后返回的 ID。
+            """,
+            """\
+            示例：
+              ./%(prog)s <watch_id>
+              ./%(prog)s <watch_id> --json
+
+            phase 的含义：
+              waiting           正在检查条件，或等待下一次检查。
+              triggered         唤醒消息已保存，准备发送。
+              sending           正在执行消息投递命令。
+              queued            Codex 已确认接受消息；后续工作由目标会话执行。
+              cancelled         监控已被取消，记录保留。
+              delivery_failed   投递命令未能启动，可排除原因后重新发送。
+              delivery_unknown  无法确认投递结果，需要结合日志和目标会话判断。
+            """,
+        ),
+        "cancel": (
+            "提前停止后台监控及 probe 子进程，保留已有记录供后续查看。",
+            """\
+            在不再需要等待时，停止对应的后台服务、正在运行的 probe 及其子进程。
+            尚未开始投递的监控会标记为 cancelled；已经结束的记录保留原有状态。
+
+            取消的对象是本地监控。被检查的训练、转换或其他外部任务照常运行，已经
+            发送到会话的消息也会保留。消息正在投递时，可先用 status 查看投递结果。
+            """,
+            """\
+            示例：
+              ./%(prog)s <watch_id>
+
+            记录会继续出现在 list 和 status 中。需要清理记录时，再使用 remove。
+            """,
+        ),
+        "retry_delivery": (
+            "对失败或结果不明的投递，再次发送已经保存的唤醒消息。",
+            """\
+            用于状态为 delivery_failed 或 delivery_unknown 的监控。
+            命令会重新启动服务，把已保存的 summary 发送到原来的目标会话。
+            它沿用原来的消息内容和连接配置，不重新运行 probe，也不重新开始等待。
+
+            delivery_unknown 表示缺少明确回执，消息可能已经到达。
+            结合 status 中的记录和目标会话，判断是否需要再次发送。
+            """,
+            """\
+            示例：
+              ./agent-wakeup status <watch_id>
+              ./%(prog)s <watch_id>
+
+            本命令返回后，发送由后台服务完成。随后用 status 查看新的投递结果。
+            """,
+        ),
+        "remove": (
+            "清理已结束监控的配置、probe 副本、输出和投递记录。",
+            """\
+            删除一个已经结束的监控。命令会停止并禁用对应的服务实例，然后删除
+            本工具保存的配置、probe 副本、最近输出和投递回执。
+            正在等待或投递的监控应先结束；需要提前停止等待时使用 cancel。
+
+            原始 probe 脚本、外部任务和产物会保留。共享的 systemd 服务模板继续
+            供其他监控使用，系统 journal 历史仍由系统管理。
+            """,
+            """\
+            示例：
+              ./%(prog)s <watch_id>
+
+            删除后的监控不再出现在 list 中，也无法再用 status 查看其记录。
+            """,
+        ),
+        "run": (
+            "运行或恢复一个监控实例的后台循环，供 systemd 服务调用。",
+            """\
+            读取已有监控的配置和状态，执行检查、等待以及消息发送。
+            命令会持续运行，直到监控结束或进程收到停止信号。
+
+            这是 systemd 服务模板使用的内部入口。日常创建监控使用 register，
+            它会自动配置并启动服务；run 用于执行已注册的那一份监控。
+            """,
+            """\
+            服务调用形式：
+              ./%(prog)s --watch_id <watch_id> --state_dir /path/to/wakeup-state
+            """,
+        ),
     }
-    for name, description in descriptions.items():
+    for name, (summary, description, examples) in descriptions.items():
         command = commands.add_parser(
             name,
-            help=description,
-            description=description,
-            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            help=summary,
+            description=dedent(description),
+            epilog=dedent(examples),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
         )
         command.add_argument(
             "--state_dir",
             type=Path,
             default=Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
             / "agent-wakeup",
-            help="监控状态目录",
+            help="保存监控记录的目录。 管理已有监控时使用注册时的同一目录。 默认：%(default)s。",
         )
-        command.add_argument("--json", action="store_true", help="输出可供程序读取的 JSON")
+        command.add_argument(
+            "--json",
+            action="store_true",
+            help="将结果输出为单行 JSON，便于其他脚本读取。默认输出带缩进的 JSON。",
+        )
         if name in {"status", "cancel", "retry_delivery", "remove"}:
-            command.add_argument("watch_id", help="register 返回的 UUID")
-        if name == "run":
-            command.add_argument("--watch_id", required=True, help="要运行的 UUID")
-        if name in {"check", "register"}:
             command.add_argument(
-                "--probe", type=Path, required=True, help="单次检查脚本；注册时保存一份快照"
+                "watch_id", help="监控的 UUID，可从 register 的返回结果或 list 中获取。"
             )
-            command.add_argument(
+        if name == "run":
+            command.add_argument("--watch_id", required=True, help="要运行的已有监控 UUID。")
+        if name in {"check", "register"}:
+            probe_options = command.add_argument_group("probe 的运行方式")
+            probe_options.add_argument(
+                "--probe",
+                type=Path,
+                required=True,
+                help="每次执行只检查一次条件的脚本路径。register 会保存脚本副本，check 执行原文件。",
+            )
+            probe_options.add_argument(
                 "--interpreter",
                 default=sys.executable,
-                help="运行 probe 的解释器，可指定其他项目的 Python 或 Bash",
+                help="执行 probe 的解释器。 默认使用本工具 uv 环境中的 Python，也可指定其他 Python 或 Bash。",
             )
-            command.add_argument(
-                "--cwd", type=Path, default=Path.cwd(), help="probe 和 queue 的工作目录"
+            probe_options.add_argument(
+                "--cwd",
+                type=Path,
+                default=Path.cwd(),
+                help="probe 的工作目录；注册监控后，消息投递命令也使用此目录。 默认是调用时的当前目录。",
             )
-            command.add_argument(
+            probe_options.add_argument(
                 "--env",
                 action="append",
                 default=[],
                 metavar="NAME=VALUE",
-                help="环境覆盖，可重复；私有配置中保存，不复制整个终端环境",
+                help=(
+                    "给执行命令设置环境变量，可多次传入，例如 --env API_URL=https://example.com。 "
+                    + (
+                        "注册时会保存 PATH、LANG、LC_ALL 及这些显式值，供后台使用。"
+                        if name == "register"
+                        else "这些值会覆盖本次检查的当前环境。"
+                    )
+                ),
             )
-            command.add_argument(
+            probe_options.add_argument(
                 "--probe_timeout_sec",
                 type=positive,
                 default=120,
-                help="一次 probe 的最长运行时间；stdout/stderr 各最多 64 KiB",
+                help="单次检查最多允许的秒数，超时算作执行错误。 默认 %(default)s 秒；stdout 和 stderr 各最多 64 KiB。",
             )
             command.add_argument(
-                "probe_args", nargs=argparse.REMAINDER, help="在 -- 后填写传给 probe 的参数"
+                "probe_args",
+                nargs=argparse.REMAINDER,
+                help="在 -- 后填写，作为参数原样传给 probe。",
             )
         if name == "register":
-            command.add_argument("--key", required=True, help="目标会话内的注册去重键")
-            command.add_argument(
+            target_options = command.add_argument_group("监控名称与目标会话")
+            target_options.add_argument(
+                "--key",
+                required=True,
+                help="监控在目标会话中的名称，用于识别重复注册，例如 report-ready。",
+            )
+            target_options.add_argument(
                 "--thread_id",
                 default=os.environ.get("CODEX_THREAD_ID"),
-                help="目标 Codex UUID；默认来自 CODEX_THREAD_ID",
+                help="目标 Codex 会话 UUID。默认从 CODEX_THREAD_ID 读取；该变量未设置时，显式填写 UUID。",
             )
-            command.add_argument(
-                "--codex_binary", default="codex", help="Codex CLI 程序；注册时解析绝对路径"
+            target_options.add_argument(
+                "--codex_binary",
+                default="codex",
+                help="Codex CLI 的程序名或路径。 注册时保存其绝对路径，供后台发送消息时使用。 默认：%(default)s。",
             )
-            command.add_argument(
+            target_options.add_argument(
                 "--codex_home",
                 type=Path,
                 default=Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))),
-                help="目标 Codex 的数据目录",
+                help="目标 Codex 的账号和数据目录，让后台命令连接原会话所属的账号环境。 默认：%(default)s。",
             )
-            command.add_argument(
-                "--codex_remote", help="可选的现有 app-server 地址，例如 unix:///path/server.sock"
+            target_options.add_argument(
+                "--codex_remote",
+                help="已有 Codex app-server 的地址，例如 unix:///path/server.sock。 省略时使用 Codex CLI 的默认连接方式。",
             )
-            command.add_argument(
+            timing_options = command.add_argument_group("检查间隔与结束条件")
+            timing_options.add_argument(
                 "--interval_sec",
                 type=positive,
                 default=300,
-                help="一次成功检查结束到下一次检查的间隔",
+                help="一次有效检查结束后，到下一次检查开始前的等待秒数。默认 %(default)s 秒。",
             )
-            command.add_argument(
+            timing_options.add_argument(
                 "--max_wait_sec",
                 type=positive,
                 default=604800,
-                help="从注册开始的总等待期限；重启不会重置",
+                help="从首次注册起允许等待的总秒数。 到期后向会话发送说明消息；服务重启沿用原期限。 默认 %(default)s 秒。",
             )
-            command.add_argument(
+            timing_options.add_argument(
                 "--max_probe_errors",
                 type=positive_integer,
                 default=5,
-                help="连续执行错误达到此数后发送异常 prompt；退避上限 15 分钟",
+                help="超时、非零退出码或无效 JSON 均计为执行错误。 连续错误达到此数后，发送异常说明并停止检查。 错误时逐步延长重试间隔，有效结果会清零计数。 默认：%(default)s。",
             )
-            command.add_argument(
+            timing_options.add_argument(
                 "--queue_timeout_sec",
                 type=positive,
                 default=60,
-                help="投递命令超时；结果不明确时保留记录，等待显式重试",
+                help="消息投递命令最多允许的秒数。 没有明确回执时保留 delivery_unknown 记录，供核对和重试。 默认 %(default)s 秒。",
             )
     return root
 
