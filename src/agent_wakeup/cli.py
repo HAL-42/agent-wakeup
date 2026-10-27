@@ -20,11 +20,11 @@ from jsonschema import ValidationError
 from loguru import logger
 
 from . import service
+from .managers import ServiceManager, get_manager
 from .model import WakeupError
 from .process import execute, parse_probe
 from .runner import run_watch
 from .store import Store
-from .systemd import Systemd
 
 
 def positive(value: str) -> float:
@@ -63,9 +63,10 @@ def parser() -> argparse.ArgumentParser:
             让 Agent 把长时间等待交给后台进程，条件满足后自动回到原会话继续工作。
 
             Agent 编写一个每次只检查一次条件的 probe，再用 register 注册监控。
-            运行器通过 systemd 用户服务定期执行 probe；需要唤醒时，将 probe 返回的
+            运行器通过本机的用户后台服务定期执行 probe；需要唤醒时，将 probe 返回的
             summary 通过 codex queue 发送到目标会话。等待期间的轮询无需调用模型。
             probe 可选择发送中间通知后继续监控，或在最终唤醒后结束监控。
+            Linux 使用 systemd，macOS 使用 launchd。
             """),
         epilog=dedent("""\
             从本地项目目录开始：
@@ -88,7 +89,7 @@ def parser() -> argparse.ArgumentParser:
             "保存 probe 和目标会话，启动后台监控，并返回可查询的监控 ID。",
             """\
             将一个 probe 注册为后台监控，供 Agent 结束当前轮次后继续等待条件。
-            命令会保存脚本副本、运行参数和目标会话，准备 systemd 用户服务并启动运行器。
+            命令会保存脚本副本、运行参数和目标会话，准备本机的用户服务并启动运行器。
             返回结果包括 watch_id、key、服务名称、当前状态和记录目录。
 
             新监控启动后先检查一次。probe 的 state 决定本次如何处理：
@@ -101,6 +102,9 @@ def parser() -> argparse.ArgumentParser:
 
             同一会话中，相同 key 和相同配置会复用原监控，输出 reused=true。
             已结束的记录也会被复用；开始新一轮监控，或更换脚本、参数时，使用新的 key。
+
+            macOS 会为未结束的监控创建用户 LaunchAgent。注销时监控停止，下次登录
+            恢复等待中的监控。休眠时间计入总等待期限；投递失败仍按原规则暂停。
             """,
             """\
             示例：
@@ -137,8 +141,9 @@ def parser() -> argparse.ArgumentParser:
             "诊断本机是否具备运行条件，帮助定位命令或用户服务的环境问题。",
             """\
             检查 uv 和 Codex CLI 是否可用、Codex 是否支持 queue，以及能否连接
-            systemd 用户管理器。输出还会列出 Python 版本、项目路径、状态目录和
-            当前的 linger 设置，便于定位环境问题。
+            本机的用户服务管理器。输出还会列出 Python 版本、项目路径和状态目录。
+            Linux 报告 systemd 用户管理器和 linger 设置；macOS 报告当前用户的
+            launchd 图形登录域和 LaunchAgents 目录，便于定位环境问题。
 
             这是按需使用的诊断命令。它只报告检查结果，不运行 probe、发送消息或修改
             系统配置。运行条件满足时返回退出码 0，存在缺失条件时返回 1。
@@ -168,9 +173,9 @@ def parser() -> argparse.ArgumentParser:
             """,
         ),
         "status": (
-            "查看一个监控的检查结果、消息投递结果和 systemd 服务状态。",
+            "查看一个监控的检查结果、消息投递结果和后台服务状态。",
             """\
-            查看指定 watch_id 的详细记录，以及对应 systemd 服务的当前状态。
+            查看指定 watch_id 的详细记录，以及对应后台服务的当前状态。
             结果包括目标会话、脚本来源、工作目录、等待期限、检查次数、最近摘要、
             最近错误和消息投递回执。它用于了解监控进展，不会发起新的 probe 检查。
 
@@ -178,6 +183,10 @@ def parser() -> argparse.ArgumentParser:
             和各次投递命令的输出。queued_message_id 和 queued_at 记录最近一次成功
             投递的消息 ID 和时间。监控处于 waiting 时，也可能已经发送过中间通知。
             当 reason 为 probe_notify 时，当前或最近一次投递属于中间通知。
+
+            unit 在 Linux 上是 systemd 单元名，在 macOS 上是 LaunchAgent 标识。
+            macOS 的 service 字段会显示登录域、配置路径、是否已加载、是否正在运行和 PID。
+            正常结束后，配置文件会删除，已加载的服务信息可能保留到 remove 或注销时清理。
             """,
             """\
             示例：
@@ -237,8 +246,9 @@ def parser() -> argparse.ArgumentParser:
             本工具保存的配置、probe 副本、最近输出和投递回执。
             正在等待或投递的监控应先结束；需要提前停止等待时使用 cancel。
 
-            原始 probe 脚本、外部任务和产物会保留。共享的 systemd 服务模板继续
-            供其他监控使用，系统 journal 历史仍由系统管理。
+            原始 probe 脚本、外部任务和产物会保留。Linux 的共享 systemd 模板继续
+            供其他监控使用，journal 历史由系统管理。macOS 会卸载对应的 LaunchAgent
+            并删除其登录启动配置，运行器输出随监控记录一起清理。
             """,
             """\
             示例：
@@ -248,12 +258,12 @@ def parser() -> argparse.ArgumentParser:
             """,
         ),
         "run": (
-            "运行或恢复一个监控实例的后台循环，供 systemd 服务调用。",
+            "运行或恢复一个监控实例的后台循环，供本机后台服务调用。",
             """\
             读取已有监控的配置和状态，执行检查、等待以及消息发送。
             命令会持续运行，直到监控结束或进程收到停止信号。
 
-            这是 systemd 服务模板使用的内部入口。日常创建监控使用 register，
+            这是后台服务使用的内部入口。日常创建监控使用 register，
             它会自动配置并启动服务；run 用于执行已注册的那一份监控。
             """,
             """\
@@ -387,7 +397,7 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def doctor(store: Store, manager: Systemd) -> dict[str, t.Any]:
+def doctor(store: Store, manager: ServiceManager) -> dict[str, t.Any]:
     """Collect local capabilities without sending a completion message."""
     checks: dict[str, t.Any] = {
         "platform": sys.platform,
@@ -397,23 +407,12 @@ def doctor(store: Store, manager: Systemd) -> dict[str, t.Any]:
         "project_dir": str(service.PROJECT_DIR),
         "state_dir": str(store.root),
     }
-    try:
-        checks["user_manager"] = manager.control("show", "--property=Version", "--value")
-    except (OSError, subprocess.CalledProcessError) as error:
-        checks["user_manager_error"] = str(error)
+    checks.update(manager.diagnostics())
     if checks["codex"]:
         result = subprocess.run(
             [checks["codex"], "queue", "--help"], capture_output=True, text=True, timeout=20
         )
         checks["queue_supported"] = result.returncode == 0 and "--thread" in result.stdout
-    if shutil.which("loginctl"):
-        result = subprocess.run(
-            ["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        checks["linger"] = result.stdout.strip() if result.returncode == 0 else "unknown"
     checks["healthy"] = bool(
         checks["uv"] and checks.get("queue_supported") and checks.get("user_manager")
     )
@@ -421,7 +420,7 @@ def doctor(store: Store, manager: Systemd) -> dict[str, t.Any]:
 
 
 def dispatch(
-    args: argparse.Namespace, store: Store, manager: Systemd
+    args: argparse.Namespace, store: Store, manager: ServiceManager
 ) -> dict[str, t.Any] | list[dict[str, t.Any]]:
     """Execute a parsed command and return its structured result."""
     if args.command in {"check", "register"}:
@@ -502,9 +501,7 @@ def main() -> int:
     )
     args = parser().parse_args()
     try:
-        if sys.platform != "linux":
-            raise WakeupError("首版需要 Linux 和 systemd 用户服务。")
-        result = dispatch(args, Store(args.state_dir), Systemd())
+        result = dispatch(args, Store(args.state_dir), get_manager())
     except (WakeupError, OSError, ValueError, ValidationError, subprocess.SubprocessError) as error:
         detail = error.stderr if isinstance(error, subprocess.CalledProcessError) else str(error)
         logger.error("{}", detail)

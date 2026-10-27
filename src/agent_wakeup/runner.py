@@ -8,10 +8,10 @@ from jsonschema import ValidationError
 from loguru import logger
 
 from .delivery import send_codex
+from .managers import ServiceManager
 from .model import TERMINAL, Config, WakeupError
 from .process import execute, parse_probe
 from .store import Store, file_lock
-from .systemd import Systemd
 
 
 def trigger(store: Store, watch_id: str, summary: str, reason: str) -> None:
@@ -104,7 +104,9 @@ def poll_once(store: Store, config: Config, stopped: threading.Event) -> None:
                 logger.info("{} probe triggered: {}", config.watch_id, result_value["state"])
 
 
-def run_watch(store: Store, watch_id: str, manager: Systemd, stopped: threading.Event) -> None:
+def run_watch(
+    store: Store, watch_id: str, manager: ServiceManager, stopped: threading.Event
+) -> None:
     """Run or recover one watch until delivery, cancellation or a stop signal.
 
     Args:
@@ -145,9 +147,13 @@ def run_watch(store: Store, watch_id: str, manager: Systemd, stopped: threading.
             poll_once(store, config, stopped)
         if store.state(watch_id).phase in TERMINAL:
             try:
-                manager.disable(config.unit)
-            except subprocess.CalledProcessError as error:
+                manager.finish(config.unit)
+            except (OSError, subprocess.SubprocessError) as error:
                 with store.edit(watch_id) as state:
-                    state.cleanup_error = error.stderr or str(error)
-                logger.warning("{} could not disable service: {}", watch_id, error.stderr)
+                    state.cleanup_error = (
+                        error.stderr or str(error)
+                        if isinstance(error, subprocess.CalledProcessError)
+                        else str(error)
+                    )
+                logger.warning("{} could not finish service cleanup: {}", watch_id, error)
         logger.info("{} runner stopped: {}", watch_id, store.state(watch_id).phase)

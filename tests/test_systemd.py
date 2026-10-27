@@ -1,5 +1,6 @@
 """Opt-in live user-manager tests; all units belong to a temporary state root."""
 
+import json
 import os
 import subprocess
 import sys
@@ -7,7 +8,6 @@ import threading
 import time
 import typing as t
 from pathlib import Path
-from textwrap import dedent
 from uuid import uuid4
 
 import pytest
@@ -17,8 +17,8 @@ from agent_wakeup.store import Store
 from agent_wakeup.systemd import Systemd
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("AGENT_WAKEUP_SYSTEMD_TEST") != "1",
-    reason="set AGENT_WAKEUP_SYSTEMD_TEST=1 for live systemd tests",
+    sys.platform != "linux" or os.environ.get("AGENT_WAKEUP_SYSTEMD_TEST") != "1",
+    reason="set AGENT_WAKEUP_SYSTEMD_TEST=1 on Linux for live systemd tests",
 )
 
 
@@ -45,26 +45,11 @@ def cleanup(store: Store, manager: Systemd) -> None:
 def test_systemd_restart_delivery_and_cleanup(tmp_path: Path) -> None:
     """Notifications keep the service alive; restart resumes checks until the final wake."""
     store, manager = Store(tmp_path / "state"), Systemd()
-    probe = tmp_path / "probe.py"
-    probe.write_text(
-        dedent("""\
-        import json
-        from pathlib import Path
-
-        if Path('ready').exists():
-            result = {'state': 'wake', 'summary': 'live systemd result'}
-        elif Path('notify').exists():
-            Path('notify').unlink()
-            result = {'state': 'notify', 'summary': 'intermediate result'}
-        else:
-            result = {'state': 'wait', 'summary': 'waiting'}
-        print(json.dumps(result))
-        """)
-    )
+    probe = Path(__file__).parent / "probes/lifecycle.py"
     queue = tmp_path / "codex"
     queue.write_text(
-        f"#!{sys.executable}\nimport sys\nfrom pathlib import Path\n"
-        + "with Path('receipt').open('a') as stream: stream.write(sys.argv[-1] + '\\n')\n"
+        "#!/usr/bin/env python3\nimport json, sys\nfrom pathlib import Path\n"
+        + "with Path('receipt').open('a') as stream: stream.write(json.dumps(sys.argv[-1]) + '\\n')\n"
         + "print('Queued message live-test for thread ' + sys.argv[sys.argv.index('--thread') + 1] + '.')\n"
     )
     queue.chmod(0o700)
@@ -76,9 +61,9 @@ def test_systemd_restart_delivery_and_cleanup(tmp_path: Path) -> None:
             key="systemd-restart",
             probe=probe,
             interpreter=sys.executable,
-            probe_args=[],
+            probe_args=[str(tmp_path)],
             cwd=tmp_path,
-            env={},
+            env={"PATH": os.environ["PATH"]},
             thread_id=str(uuid4()),
             codex_binary=str(queue),
             codex_home=tmp_path,
@@ -100,7 +85,10 @@ def test_systemd_restart_delivery_and_cleanup(tmp_path: Path) -> None:
         assert manager.status(config.unit)["ActiveState"] == "active"
         assert manager.status(config.unit)["UnitFileState"] == "enabled"
         assert manager.control("show", config.unit, "--property=MainPID", "--value") == original_pid
-        assert (tmp_path / "receipt").read_text().splitlines() == ["intermediate result"]
+        first_messages = [
+            json.loads(line) for line in (tmp_path / "receipt").read_text().splitlines()
+        ]
+        assert len(first_messages) == 1
         state = store.state(watch_id)
         assert state.last_check_at is not None
         assert state.next_check_at - state.last_check_at == pytest.approx(
@@ -111,14 +99,16 @@ def test_systemd_restart_delivery_and_cleanup(tmp_path: Path) -> None:
         manager.control("restart", config.unit)
         until(lambda: store.state(watch_id).started_at != original_start)
         until(lambda: store.state(watch_id).checks > original_checks)
-        assert (tmp_path / "receipt").read_text().splitlines() == ["intermediate result"]
+        assert [
+            json.loads(line) for line in (tmp_path / "receipt").read_text().splitlines()
+        ] == first_messages
         assert store.config(watch_id).deadline == config.deadline
-        (tmp_path / "ready").touch()
+        (tmp_path / "wake").touch()
         until(lambda: store.state(watch_id).phase == "queued")
         until(lambda: manager.status(config.unit)["ActiveState"] == "inactive")
-        assert (tmp_path / "receipt").read_text().splitlines() == [
-            "intermediate result",
-            "live systemd result",
+        assert [json.loads(line) for line in (tmp_path / "receipt").read_text().splitlines()] == [
+            first_messages[0],
+            store.state(watch_id).summary,
         ]
         assert manager.status(config.unit)["UnitFileState"] == "disabled"
         service.remove(store, manager, watch_id)
@@ -152,7 +142,7 @@ def test_systemd_cancel_active_probe(tmp_path: Path, notify_first: bool) -> None
     )
     queue = tmp_path / "codex"
     queue.write_text(
-        f"#!{sys.executable}\nimport sys\n"
+        "#!/usr/bin/env python3\nimport sys\n"
         + "print('Queued message cancel-test for thread ' + sys.argv[sys.argv.index('--thread') + 1] + '.')\n"
     )
     queue.chmod(0o700)
@@ -166,7 +156,7 @@ def test_systemd_cancel_active_probe(tmp_path: Path, notify_first: bool) -> None
             interpreter=sys.executable,
             probe_args=[],
             cwd=tmp_path,
-            env={},
+            env={"PATH": os.environ["PATH"]},
             thread_id=str(uuid4()),
             codex_binary=str(queue),
             codex_home=tmp_path,

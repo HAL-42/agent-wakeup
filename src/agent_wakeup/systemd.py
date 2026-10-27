@@ -1,17 +1,14 @@
 """Systemd user-service integration, isolated from monitoring logic."""
 
-import hashlib
 import os
+import shutil
 import subprocess
+import typing as t
 from importlib.resources import files
 from pathlib import Path
 
+from .managers import installation_id
 from .model import Config, WakeupError
-
-
-def installation_id(project: Path, state_root: Path) -> str:
-    """Identify one project and state-root installation on this host."""
-    return hashlib.sha256(f"{project}\0{state_root}".encode()).hexdigest()[:16]
 
 
 def quote_unit(value: str, *, command: bool = False) -> str:
@@ -48,6 +45,10 @@ class Systemd:
             text=True,
             timeout=30,
         ).stdout.strip()
+
+    def unit_name(self, project: Path, state_root: Path, watch_id: str) -> str:
+        """Return the existing systemd instance name."""
+        return f"agent-wakeup-{installation_id(project, state_root)}@{watch_id}.service"
 
     def prepare(self, config: Config, state_root: Path) -> None:
         """Create or refresh this installation's service template when needed."""
@@ -89,7 +90,11 @@ class Systemd:
             self.control("reset-failed", unit)
         self.control("enable", "--now", unit)
 
-    def disable(self, unit: str) -> None:
+    def is_running(self, unit: str) -> bool:
+        """Report active services and services already starting."""
+        return self.status(unit).get("ActiveState") in {"active", "activating"}
+
+    def finish(self, unit: str) -> None:
         """Remove boot activation without stopping the caller's process."""
         self.control("disable", unit)
 
@@ -103,3 +108,20 @@ class Systemd:
             "show", unit, "--property=LoadState,ActiveState,SubState,UnitFileState"
         )
         return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+
+    def diagnostics(self) -> dict[str, t.Any]:
+        """Report the user manager and existing linger setting."""
+        checks: dict[str, t.Any] = {"service_manager": "systemd"}
+        try:
+            checks["user_manager"] = self.control("show", "--property=Version", "--value")
+        except (OSError, subprocess.SubprocessError) as error:
+            checks["user_manager_error"] = str(error)
+        if shutil.which("loginctl"):
+            result = subprocess.run(
+                ["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            checks["linger"] = result.stdout.strip() if result.returncode == 0 else "unknown"
+        return checks

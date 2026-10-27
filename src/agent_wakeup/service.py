@@ -10,9 +10,9 @@ from dataclasses import asdict
 from pathlib import Path
 from uuid import UUID, uuid4
 
+from .managers import ServiceManager
 from .model import TERMINAL, Config, WakeupError
 from .store import Store, file_lock
-from .systemd import Systemd, installation_id
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 
@@ -27,7 +27,7 @@ def executable(name: str) -> str:
 
 def register(
     store: Store,
-    manager: Systemd,
+    manager: ServiceManager,
     *,
     key: str,
     probe: Path,
@@ -49,7 +49,7 @@ def register(
 
     Args:
         store: State root for this installation.
-        manager: Systemd operations.
+        manager: Platform service operations.
         key: Caller-selected key unique within the target session.
         probe: Single script to snapshot.
         interpreter: Executable used to run the snapshot.
@@ -113,14 +113,15 @@ def register(
                 fingerprint=fingerprint,
                 created_at=now,
                 deadline=now + max_wait_sec,
-                unit=f"agent-wakeup-{installation_id(PROJECT_DIR, store.root)}@{watch_id}.service",
+                unit=manager.unit_name(PROJECT_DIR, store.root, watch_id),
             )
             store.create(config, content)
-        manager.prepare(config, store.root)
+        if store.state(config.watch_id).phase not in TERMINAL:
+            manager.prepare(config, store.root)
     state = store.state(config.watch_id)
     if state.phase not in TERMINAL:
         try:
-            if manager.status(config.unit).get("ActiveState") not in {"active", "activating"}:
+            if not manager.is_running(config.unit):
                 with store.edit(config.watch_id) as current:
                     current.started_at = None
             manager.start(config.unit)
@@ -128,7 +129,7 @@ def register(
             while store.state(config.watch_id).started_at is None:
                 if time.monotonic() >= deadline:
                     raise WakeupError(
-                        f"运行器尚未确认启动；查看 status {config.watch_id} 和 journal。"
+                        f"运行器尚未确认启动；查看 status {config.watch_id} 和服务日志。"
                     )
                 time.sleep(0.1)
         except (OSError, WakeupError, subprocess.SubprocessError) as error:
@@ -149,7 +150,7 @@ def register(
     }
 
 
-def inspect_watch(store: Store, manager: Systemd, watch_id: str) -> dict[str, t.Any]:
+def inspect_watch(store: Store, manager: ServiceManager, watch_id: str) -> dict[str, t.Any]:
     """Describe a saved watch without disclosing environment override values."""
     config = store.config(watch_id)
     return {
@@ -166,7 +167,7 @@ def inspect_watch(store: Store, manager: Systemd, watch_id: str) -> dict[str, t.
     }
 
 
-def cancel(store: Store, manager: Systemd, watch_id: str) -> dict[str, str]:
+def cancel(store: Store, manager: ServiceManager, watch_id: str) -> dict[str, str]:
     """Cancel pending monitoring; a delivery already started keeps its evidence."""
     config = store.config(watch_id)
     with store.edit(watch_id) as state:
@@ -178,20 +179,24 @@ def cancel(store: Store, manager: Systemd, watch_id: str) -> dict[str, str]:
     return {"watch_id": watch_id, "phase": store.state(watch_id).phase}
 
 
-def retry_delivery(store: Store, manager: Systemd, watch_id: str) -> dict[str, str]:
+def retry_delivery(store: Store, manager: ServiceManager, watch_id: str) -> dict[str, str]:
     """Retry only a failed or unconfirmed delivery, using its saved prompt."""
     config = store.config(watch_id)
     with file_lock(store.directory(watch_id) / "run.lock", blocking=False):
+        phase = store.state(watch_id).phase
+        if phase not in {"delivery_failed", "delivery_unknown"}:
+            raise WakeupError(f"当前状态不需要重试投递：{phase}")
+        # A runner may have released its lock just before its process exits. Unload
+        # that instance before preparing the retry so start cannot reuse a dying job.
+        manager.stop(config.unit)
         with store.edit(watch_id) as state:
-            if state.phase not in {"delivery_failed", "delivery_unknown"}:
-                raise WakeupError(f"当前状态不需要重试投递：{state.phase}")
             state.phase, state.last_error, state.started_at = "triggered", "", None
     manager.prepare(config, store.root)
     manager.start(config.unit)
     return {"watch_id": watch_id, "phase": store.state(watch_id).phase}
 
 
-def remove(store: Store, manager: Systemd, watch_id: str) -> dict[str, t.Any]:
+def remove(store: Store, manager: ServiceManager, watch_id: str) -> dict[str, t.Any]:
     """Remove a finished watch's records after disabling its service."""
     with file_lock(store.root / "registry.lock"):
         directory = store.directory(watch_id)

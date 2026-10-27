@@ -48,7 +48,7 @@ def context(tmp_path: Path) -> tuple[Store, FakeSystemd, Path, Path]:
     store = Store(tmp_path / "state")
     queue = tmp_path / "fake-codex"
     queue.write_text(
-        f"#!{sys.executable}\n"
+        "#!/usr/bin/env python3\n"
         + "import json, os, sys, time\n"
         + "from pathlib import Path\n"
         + "args = sys.argv[1:]\n"
@@ -181,7 +181,7 @@ def test_notification_retry_resumes_monitoring(
     if failure == "missing":
         queue.unlink()
     else:
-        queue.write_text(f"#!{sys.executable}\nprint('no confirmed receipt')\n")
+        queue.write_text("#!/usr/bin/env python3\nprint('no confirmed receipt')\n")
     run_watch(store, watch_id, manager, threading.Event())
     state = store.state(watch_id)
     assert state.phase == ("delivery_failed" if failure == "missing" else "delivery_unknown")

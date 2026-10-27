@@ -1,11 +1,14 @@
 """Bounded subprocess execution for probes and delivery commands."""
 
+import fcntl
 import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import typing as t
+from contextlib import ExitStack
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -71,16 +74,45 @@ def execute(
         Exit status, decoded output and any timeout/cancellation reason.
     """
     reason = ""
-    with stdout_path.open("wb") as output, stderr_path.open("wb") as errors:
+    with ExitStack() as resources:
+        command = argv
+        pass_fds: tuple[int, ...] = ()
+        reader = None
+        if sys.platform == "darwin":
+            # Preserve the direct-exec error for a missing registered executable.
+            if Path(argv[0]).is_absolute():
+                Path(argv[0]).stat()
+            # The guard retains this flock after a runner crash. A replacement runner
+            # waits for cleanup before truncating output files or starting another command.
+            execution_lock = resources.enter_context(
+                (stdout_path.parent / "command.lock").open("a")
+            )
+            fcntl.flock(execution_lock.fileno(), fcntl.LOCK_EX)
+            read_fd, write_fd = os.pipe()
+            reader = resources.enter_context(os.fdopen(read_fd, "rb", buffering=0))
+            resources.enter_context(os.fdopen(write_fd, "wb", buffering=0))
+            pass_fds = (read_fd, execution_lock.fileno())
+            command = [
+                sys.executable,
+                str(Path(__file__).with_name("_parent_guard.py")),
+                str(read_fd),
+                str(execution_lock.fileno()),
+                *argv,
+            ]
+        output = resources.enter_context(stdout_path.open("wb"))
+        errors = resources.enter_context(stderr_path.open("wb"))
         process = subprocess.Popen(
-            argv,
+            command,
             cwd=cwd,
             env=os.environ | env,
             stdin=subprocess.DEVNULL,
             stdout=output,
             stderr=errors,
             start_new_session=True,
+            pass_fds=pass_fds,
         )
+        if reader is not None:
+            reader.close()
         deadline = time.monotonic() + timeout
         try:
             while process.poll() is None:

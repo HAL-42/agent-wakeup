@@ -22,7 +22,7 @@ agent-wakeup 将这段等待交给普通的后台进程，并在需要继续工�
 
 Agent 把判断条件写成一个 <u>probe</u>，也就是执行一次状态检查的脚本。每次运行后，probe 告诉运行器是继续等待，还是唤醒会话。如果需要唤醒，probe 会提供一段消息，告知 Agent 检查结果以及接下来要做的工作，并决定通知后继续检查还是结束监控。
 
-项目中的后台运行器负责按间隔执行 probe。运行器由 Linux 的 <u>systemd</u> 用户服务管理，因此 Agent 可以在注册监控后结束当前轮次。等待期间的轮询由这些普通进程完成，无需调用模型。
+项目中的后台运行器负责按间隔执行 probe。Linux 使用 <u>systemd</u> 用户服务管理运行器，macOS 使用 <u>launchd</u> 用户代理。因此 Agent 可以在注册监控后结束当前轮次，等待期间的轮询由这些普通进程完成，无需调用模型。
 
 当前版本通过 `codex queue` 向 Codex 会话发送消息。注册监控时会保存目标会话及其 Codex 运行环境；条件满足后，运行器把 probe 提供的消息发送到这个会话。目标 Codex 服务需要保持运行，原会话需要保持加载，这样消息到达后就能自动开始下一轮。
 
@@ -87,7 +87,7 @@ print(json.dumps(result, ensure_ascii=False))
   --probe /path/to/probe.py
 ```
 
-`--key` 为这项监控指定一个便于识别的名称。`register` 默认绑定当前 `CODEX_THREAD_ID` 指定的会话，也可以用 `--thread_id` 指定另一个会话。首次注册会自动生成所需的 systemd 用户服务配置，并保存 probe 的副本用于后续检查。
+`--key` 为这项监控指定一个便于识别的名称。`register` 默认绑定当前 `CODEX_THREAD_ID` 指定的会话，也可以用 `--thread_id` 指定另一个会话。首次注册会自动生成本机所需的用户服务配置，并保存 probe 的副本用于后续检查。
 
 按具体任务选择检查间隔、总等待期限和单次检查超时。参数的作用、默认值和调用示例见 `agent-wakeup register --help`。
 
