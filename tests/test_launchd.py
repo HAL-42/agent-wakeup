@@ -13,7 +13,7 @@ import pytest
 
 from agent_wakeup import managers, service
 from agent_wakeup.cli import doctor
-from agent_wakeup.launchd import Launchd
+from agent_wakeup.launchd import CONTROL_TIMEOUT_SEC, Launchd
 from agent_wakeup.model import WakeupError
 from agent_wakeup.store import Store
 from agent_wakeup.systemd import Systemd
@@ -29,7 +29,7 @@ class FakeLaunchd(Launchd):
         self.jobs: dict[str, int | None] = {}
         self.calls: list[tuple[str, ...]] = []
 
-    def control(self, *args: str) -> str:
+    def control(self, *args: str, timeout_sec: float = CONTROL_TIMEOUT_SEC) -> str:
         """Emulate launchctl and acknowledge startup without executing a real service."""
         self.calls.append(args)
         operation = args[0]
@@ -131,6 +131,58 @@ def test_plist_and_registration_reuse(
     assert value["StandardErrorPath"] == str(store.directory(watch_id) / "runner.stderr")
     assert "EXAMPLE_VARIABLE" not in value["EnvironmentVariables"]
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    "delayed_operation,delay_sec,starts",
+    [("kickstart", 31, True), ("kickstart", 61, False), ("print", 31, False)],
+    ids=["restart-after-throttle", "restart-deadline", "status-deadline"],
+)
+def test_start_waits_for_throttle_with_bounded_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    delayed_operation: str,
+    delay_sec: float,
+    starts: bool,
+) -> None:
+    """A throttled restart can complete while stalled commands still time out."""
+    manager = Launchd(tmp_path / "LaunchAgents", uid=501)
+    unit = manager.unit_name(tmp_path, tmp_path / "state", str(uuid4()))
+    running = False
+    kickstarts = 0
+
+    def run_launchctl(
+        command: list[str], *, timeout: float, **options: t.Any
+    ) -> subprocess.CompletedProcess[str]:
+        """Model launchctl waiting for a spawn without delaying the unit test."""
+        nonlocal running, kickstarts
+        operation = command[1]
+        if operation == delayed_operation and delay_sec > timeout:
+            raise subprocess.TimeoutExpired(command, timeout)
+        if operation == "print":
+            output = f"job = {{\n\tstate = {'running' if running else 'not running'}\n"
+            if running:
+                output += "\tpid = 12345\n"
+            output += "}\n"
+        elif operation == "kickstart":
+            running = True
+            kickstarts += 1
+            output = ""
+        else:
+            raise AssertionError(command)
+        return subprocess.CompletedProcess(command, 0, stdout=output)
+
+    monkeypatch.setattr(subprocess, "run", run_launchctl)
+    if starts:
+        manager.start(unit)
+        assert manager.status(unit)["running"]
+        manager.start(unit)
+        assert kickstarts == 1
+    else:
+        with pytest.raises(subprocess.TimeoutExpired) as error:
+            manager.start(unit)
+        assert error.value.cmd[1] == delayed_operation
+        assert not running
 
 
 def test_finish_does_not_stop_runner_or_reenable_finished_watch(

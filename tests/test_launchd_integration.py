@@ -107,6 +107,7 @@ def test_launchd_lifecycle(native_watch: tuple[Store, Launchd, t.Callable[..., s
     config = store.config(watch_id)
     until(lambda: store.state(watch_id).checks >= 1)
     first_pid = manager.status(config.unit)["pid"]
+    first_started_at = store.state(watch_id).started_at
     assert register(PHASE_PROBE, probe_args=[str(directory)]) == watch_id
     assert manager.status(config.unit)["pid"] == first_pid
 
@@ -131,6 +132,8 @@ def test_launchd_lifecycle(native_watch: tuple[Store, Launchd, t.Callable[..., s
     assert manager.plist_path(config.unit).exists()
     manager.start(config.unit)
     until(lambda: store.state(watch_id).checks > original_checks)
+    assert manager.status(config.unit)["pid"] != first_pid
+    assert store.state(watch_id).started_at != first_started_at
     assert store.config(watch_id).deadline == config.deadline
     assert [
         json.loads(line) for line in (directory / "receipts").read_text().splitlines()

@@ -14,6 +14,9 @@ from .managers import installation_id
 from .model import Config, WakeupError
 
 LABEL_PREFIX = "io.github.hal-42.agent-wakeup."
+CONTROL_TIMEOUT_SEC = 30
+THROTTLE_INTERVAL_SEC = 30
+KICKSTART_TIMEOUT_SEC = THROTTLE_INTERVAL_SEC + CONTROL_TIMEOUT_SEC
 
 
 class Launchd:
@@ -24,14 +27,22 @@ class Launchd:
         self.agent_dir = (agent_dir or Path.home() / "Library/LaunchAgents").absolute()
         self.domain = f"gui/{os.getuid() if uid is None else uid}"
 
-    def control(self, *args: str) -> str:
-        """Run launchctl without a shell and expose its diagnostic output."""
+    def control(self, *args: str, timeout_sec: float = CONTROL_TIMEOUT_SEC) -> str:
+        """Run launchctl without a shell and expose its diagnostic output.
+
+        Args:
+            args: The launchctl subcommand and its literal arguments.
+            timeout_sec: Maximum time to wait for launchctl to finish.
+
+        Returns:
+            Standard output with surrounding whitespace removed.
+        """
         return subprocess.run(
             ["/bin/launchctl", *args],
             check=True,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout_sec,
         ).stdout.strip()
 
     def unit_name(self, project: Path, state_root: Path, watch_id: str) -> str:
@@ -70,7 +81,7 @@ class Launchd:
             "LimitLoadToSessionType": "Aqua",
             "RunAtLoad": True,
             "KeepAlive": {"SuccessfulExit": False},
-            "ThrottleInterval": 30,
+            "ThrottleInterval": THROTTLE_INTERVAL_SEC,
             "ExitTimeOut": 15,
             "Umask": 0o077,
             "StandardOutPath": str(directory / "runner.stdout"),
@@ -103,7 +114,8 @@ class Launchd:
                 if not self.status(unit)["loaded"]:
                     raise
         if not self.is_running(unit):
-            self.control("kickstart", f"{self.domain}/{unit}")
+            # Explicit restarts can also wait for launchd's full throttle interval.
+            self.control("kickstart", f"{self.domain}/{unit}", timeout_sec=KICKSTART_TIMEOUT_SEC)
 
     def is_running(self, unit: str) -> bool:
         """Include jobs already spawned or scheduled by launchd."""
