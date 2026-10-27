@@ -21,7 +21,7 @@ from loguru import logger
 
 from . import service
 from .managers import ServiceManager, get_manager
-from .model import WakeupError
+from .model import CATEGORY_PHASES, WakeupError
 from .process import execute, parse_probe
 from .runner import run_watch
 from .store import Store
@@ -155,10 +155,17 @@ def parser() -> argparse.ArgumentParser:
             """,
         ),
         "list": (
-            "列出保存的监控记录，查找监控 ID、目标会话和最近状态。",
+            "列出保存的监控记录，可按投递异常、监控中或已结束筛选。",
             """\
             列出所选状态目录中的全部监控，包括正在等待的监控和已经结束的记录。
             每项结果包含 watch_id、key、目标会话、当前状态和最近一次检查的摘要。
+
+            --category 只根据记录中的 phase 筛选：
+              delivery_error  投递异常：delivery_failed、delivery_unknown。
+              active          监控中：waiting、triggered、sending。
+              finished        已结束或取消：queued、cancelled。
+            不指定分类时列出全部记录。active 表示记录尚未结束，实际服务是否运行
+            可用 status 查看。本命令不查询后台服务状态。
 
             已发送过中间通知的监控可以继续处于 waiting 状态。
             状态和投递回执的含义见 status --help。
@@ -169,6 +176,9 @@ def parser() -> argparse.ArgumentParser:
             """\
             示例：
               ./%(prog)s
+              ./%(prog)s --category delivery_error
+              ./%(prog)s --category active
+              ./%(prog)s --category finished
               ./%(prog)s --state_dir /path/to/wakeup-state --json
             """,
         ),
@@ -220,23 +230,30 @@ def parser() -> argparse.ArgumentParser:
             """,
         ),
         "retry_delivery": (
-            "对失败或结果不明的投递，再次发送已经保存的唤醒消息。",
+            "重试一个或全部投递异常的监控，重新发送已保存的消息。",
             """\
             用于状态为 delivery_failed 或 delivery_unknown 的监控。
+            指定 watch_id 重试一项；--all 重试所选状态目录中这两类异常监控。
+            每项只发起一次重试，某项失败时继续处理其余项，其他状态的记录保持不变。
             命令会重新启动服务，把已保存的 summary 发送到原来的目标会话。
             它沿用原来的消息内容和连接配置，先重新发送消息，再按消息类型继续：
               notify  入队成功后恢复检查，沿用原来的检查计划和总等待期限。
               wake    入队成功后结束监控。
 
-            delivery_unknown 表示缺少明确回执，消息可能已经到达。
-            结合 status 中的记录和目标会话，判断是否需要再次发送。
+            delivery_unknown 表示缺少明确回执，消息可能已经到达，重试可能重复发送。
+            可先用 list --category delivery_error 查看将重试的记录。
             """,
             """\
             示例：
               ./agent-wakeup status <watch_id>
               ./%(prog)s <watch_id>
+              ./%(prog)s --all
+              ./%(prog)s --all --state_dir /path/to/wakeup-state --json
 
             本命令返回后，发送由后台服务完成。随后用 status 查看新的投递结果。
+            批量结果中 total 为候选数，started 为已发起数，failed 为未能发起数；
+            results 列出每项结果和失败原因。已发起不代表消息已成功入队。
+            全部发起成功或没有符合条件的记录时退出码为 0，有单项失败时为 1。
             """,
         ),
         "remove": (
@@ -292,9 +309,24 @@ def parser() -> argparse.ArgumentParser:
             action="store_true",
             help="将结果输出为单行 JSON，便于其他脚本读取。默认输出带缩进的 JSON。",
         )
-        if name in {"status", "cancel", "retry_delivery", "remove"}:
+        if name in {"status", "cancel", "remove"}:
             command.add_argument(
                 "watch_id", help="监控的 UUID，可从 register 的返回结果或 list 中获取。"
+            )
+        if name == "list":
+            command.add_argument(
+                "--category",
+                choices=tuple(CATEGORY_PHASES),
+                help="按 phase 分类筛选：delivery_error 投递异常，active 监控中，finished 已结束或取消。",
+            )
+        if name == "retry_delivery":
+            target = command.add_mutually_exclusive_group(required=True)
+            target.add_argument("watch_id", nargs="?", help="要重试的监控 UUID，与 --all 二选一。")
+            target.add_argument(
+                "--all",
+                dest="all_watches",
+                action="store_true",
+                help="批量重试所选状态目录中的 delivery_failed 和 delivery_unknown。",
             )
         if name == "run":
             command.add_argument("--watch_id", required=True, help="要运行的已有监控 UUID。")
@@ -468,20 +500,28 @@ def dispatch(
     if args.command == "doctor":
         return doctor(store, manager)
     if args.command == "list":
-        return [
-            {
-                "watch_id": watch_id,
-                "key": store.config(watch_id).key,
-                "thread_id": store.config(watch_id).thread_id,
-                **asdict(store.state(watch_id)),
-            }
-            for watch_id in store.ids()
-        ]
+        records = []
+        for watch_id in store.ids():
+            state = store.state(watch_id)
+            if args.category is not None and state.phase not in CATEGORY_PHASES[args.category]:
+                continue
+            config = store.config(watch_id)
+            records.append(
+                {
+                    "watch_id": watch_id,
+                    "key": config.key,
+                    "thread_id": config.thread_id,
+                    **asdict(state),
+                }
+            )
+        return records
     if args.command == "status":
         return service.inspect_watch(store, manager, args.watch_id)
     if args.command == "cancel":
         return service.cancel(store, manager, args.watch_id)
     if args.command == "retry_delivery":
+        if args.all_watches:
+            return service.retry_all_deliveries(store, manager)
         return service.retry_delivery(store, manager, args.watch_id)
     if args.command == "remove":
         return service.remove(store, manager, args.watch_id)
@@ -508,6 +548,13 @@ def main() -> int:
         return 1
     print(json.dumps(result, ensure_ascii=False, indent=None if args.json else 2))
     if args.command == "doctor" and isinstance(result, dict) and not result["healthy"]:
+        return 1
+    if (
+        args.command == "retry_delivery"
+        and args.all_watches
+        and isinstance(result, dict)
+        and result["failed"]
+    ):
         return 1
     return 0
 

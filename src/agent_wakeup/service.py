@@ -11,7 +11,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from .managers import ServiceManager
-from .model import TERMINAL, Config, WakeupError
+from .model import CATEGORY_PHASES, TERMINAL, Config, WakeupError
 from .store import Store, file_lock
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -184,16 +184,63 @@ def retry_delivery(store: Store, manager: ServiceManager, watch_id: str) -> dict
     config = store.config(watch_id)
     with file_lock(store.directory(watch_id) / "run.lock", blocking=False):
         phase = store.state(watch_id).phase
-        if phase not in {"delivery_failed", "delivery_unknown"}:
+        if phase not in CATEGORY_PHASES["delivery_error"]:
             raise WakeupError(f"当前状态不需要重试投递：{phase}")
         # A runner may have released its lock just before its process exits. Unload
         # that instance before preparing the retry so start cannot reuse a dying job.
         manager.stop(config.unit)
+        manager.prepare(config, store.root)
         with store.edit(watch_id) as state:
             state.phase, state.last_error, state.started_at = "triggered", "", None
-    manager.prepare(config, store.root)
-    manager.start(config.unit)
+    try:
+        manager.start(config.unit)
+    except (OSError, WakeupError, subprocess.SubprocessError) as error:
+        with store.edit(watch_id) as state:
+            # A start command can fail after the runner has already acknowledged
+            # startup. Only restore a retryable phase if delivery has not begun.
+            if state.phase == "triggered" and state.started_at is None:
+                state.phase = phase
+                state.last_error = f"启动重试失败：{error}"
+        raise
     return {"watch_id": watch_id, "phase": store.state(watch_id).phase}
+
+
+def retry_all_deliveries(store: Store, manager: ServiceManager) -> dict[str, t.Any]:
+    """Request one retry per delivery error, retaining individual startup failures.
+
+    Args:
+        store: State directory whose delivery errors should be retried.
+        manager: Platform service operations used by single-watch retries.
+
+    Returns:
+        Candidate, started and failed counts plus each watch's startup result.
+        Message delivery itself continues asynchronously in the background.
+    """
+    watch_ids = [
+        watch_id
+        for watch_id in store.ids()
+        if store.state(watch_id).phase in CATEGORY_PHASES["delivery_error"]
+    ]
+    results: list[dict[str, t.Any]] = []
+    for watch_id in watch_ids:
+        try:
+            result = retry_delivery(store, manager, watch_id)
+        except (WakeupError, OSError, ValueError, subprocess.SubprocessError) as error:
+            detail = (
+                error.stderr or str(error)
+                if isinstance(error, subprocess.CalledProcessError)
+                else str(error)
+            )
+            results.append({"watch_id": watch_id, "started": False, "error": detail})
+        else:
+            results.append({**result, "started": True})
+    started = sum(result["started"] for result in results)
+    return {
+        "total": len(results),
+        "started": started,
+        "failed": len(results) - started,
+        "results": results,
+    }
 
 
 def remove(store: Store, manager: ServiceManager, watch_id: str) -> dict[str, t.Any]:

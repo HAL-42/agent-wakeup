@@ -12,7 +12,12 @@ Phase = t.Literal[
     "delivery_failed",
     "delivery_unknown",
 ]
-TERMINAL = {"queued", "cancelled", "delivery_failed", "delivery_unknown"}
+CATEGORY_PHASES: dict[str, set[Phase]] = {
+    "delivery_error": {"delivery_failed", "delivery_unknown"},
+    "active": {"waiting", "triggered", "sending"},
+    "finished": {"queued", "cancelled"},
+}
+TERMINAL = CATEGORY_PHASES["delivery_error"] | CATEGORY_PHASES["finished"]
 OUTPUT_LIMIT = 64 * 1024
 
 

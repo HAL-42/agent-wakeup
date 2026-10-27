@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+import typing as t
 from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
@@ -12,11 +13,11 @@ from uuid import uuid4
 
 import pytest
 
-from agent_wakeup import service
-from agent_wakeup.model import WakeupError
+from agent_wakeup import cli, service
+from agent_wakeup.model import Phase, WakeupError
 from agent_wakeup.process import Result, execute, parse_probe
 from agent_wakeup.runner import run_watch
-from agent_wakeup.store import Store
+from agent_wakeup.store import Store, file_lock
 from agent_wakeup.systemd import Systemd
 
 
@@ -470,3 +471,229 @@ def test_unit_rendering_and_reuse(
     before = len(manager.calls)
     manager.prepare(config, store.root)
     assert len(manager.calls) == before
+
+
+@pytest.fixture
+def watches_by_phase(context: tuple[Store, FakeSystemd, Path, Path]) -> dict[str, str]:
+    """Save all lifecycle phases without running probes or sending messages."""
+    store, _, _, _ = context
+    watches = {}
+    for phase in t.get_args(Phase):
+        watch_id = arm(context, "raise AssertionError('probe must not run')", key=phase)
+        with store.edit(watch_id) as state:
+            state.phase = phase
+            state.summary = f"saved message for {phase}"
+            state.reason = "probe"
+        watches[phase] = watch_id
+    return watches
+
+
+@pytest.mark.parametrize(
+    ("category", "phases"),
+    [
+        (None, set(t.get_args(Phase))),
+        ("delivery_error", {"delivery_failed", "delivery_unknown"}),
+        ("active", {"waiting", "triggered", "sending"}),
+        ("finished", {"queued", "cancelled"}),
+    ],
+)
+def test_cli_list_categories_use_only_saved_phases(
+    context: tuple[Store, FakeSystemd, Path, Path],
+    watches_by_phase: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    category: str | None,
+    phases: set[str],
+) -> None:
+    """Filtering works even when services are inactive and never queries the manager."""
+    store, manager, _, receipts = context
+    argv = ["agent-wakeup", "list", "--state_dir", str(store.root), "--json"]
+    if category is not None:
+        argv += ["--category", category]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(cli, "get_manager", lambda: manager)
+    manager.calls.clear()
+
+    assert cli.main() == 0
+    records = json.loads(capsys.readouterr().out)
+    assert {record["watch_id"] for record in records} == {
+        watches_by_phase[phase] for phase in phases
+    }
+    assert all(record["summary"] == f"saved message for {record['phase']}" for record in records)
+    assert manager.calls == []
+    assert not receipts.exists()
+
+
+@pytest.mark.parametrize("all_watches", [False, True])
+def test_cli_retry_preserves_messages_and_excludes_other_phases(
+    context: tuple[Store, FakeSystemd, Path, Path],
+    watches_by_phase: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    all_watches: bool,
+) -> None:
+    """Single and bulk retries send saved messages once and leave other watches intact."""
+    store, manager, _, receipts = context
+    phases = {"delivery_failed", "delivery_unknown"} if all_watches else {"delivery_failed"}
+    selected = {watches_by_phase[phase] for phase in phases}
+    before = {watch_id: store.state(watch_id) for watch_id in store.ids()}
+    deadlines = {watch_id: store.config(watch_id).deadline for watch_id in selected}
+    target = ["--all"] if all_watches else [watches_by_phase["delivery_failed"]]
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agent-wakeup", "retry_delivery", *target, "--state_dir", str(store.root), "--json"],
+    )
+    monkeypatch.setattr(cli, "get_manager", lambda: manager)
+
+    assert cli.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    if all_watches:
+        assert (result["total"], result["started"], result["failed"]) == (2, 2, 0)
+        assert {item["watch_id"] for item in result["results"]} == selected
+    else:
+        assert result == {"watch_id": target[0], "phase": "triggered"}
+    assert not receipts.exists()
+
+    for watch_id in selected:
+        run_watch(store, watch_id, manager, threading.Event())
+        state = store.state(watch_id)
+        assert (state.phase, state.checks, state.delivery_attempts) == ("queued", 0, 1)
+        assert state.summary == before[watch_id].summary
+        assert store.config(watch_id).deadline == deadlines[watch_id]
+    for watch_id in set(store.ids()) - selected:
+        assert store.state(watch_id) == before[watch_id]
+    assert {json.loads(line)["message"] for line in receipts.read_text().splitlines()} == {
+        before[watch_id].summary for watch_id in selected
+    }
+    if all_watches:
+        assert service.retry_all_deliveries(store, manager) == {
+            "total": 0,
+            "started": 0,
+            "failed": 0,
+            "results": [],
+        }
+        assert len(receipts.read_text().splitlines()) == 2
+
+
+@pytest.mark.parametrize("operation", ["prepare", "start"])
+def test_cli_retry_all_continues_after_service_failure(
+    context: tuple[Store, FakeSystemd, Path, Path],
+    watches_by_phase: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operation: str,
+) -> None:
+    """One failed startup reports a nonzero exit but does not block subsequent retries."""
+    store, manager, _, receipts = context
+    first, second = sorted(
+        watches_by_phase[phase] for phase in ("delivery_failed", "delivery_unknown")
+    )
+    first_phase = store.state(first).phase
+    original = getattr(manager, operation)
+
+    def fail_first(*args: t.Any) -> None:
+        """Fail one service operation while allowing the other watch to start."""
+        unit = args[0].unit if operation == "prepare" else args[0]
+        if unit == store.config(first).unit:
+            raise subprocess.CalledProcessError(
+                1, ["fake-manager", operation], stderr="unavailable"
+            )
+        original(*args)
+
+    monkeypatch.setattr(manager, operation, fail_first)
+    monkeypatch.setattr(cli, "get_manager", lambda: manager)
+    monkeypatch.setattr(
+        sys, "argv", ["agent-wakeup", "retry_delivery", "--all", "--state_dir", str(store.root)]
+    )
+    assert cli.main() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert (result["total"], result["started"], result["failed"]) == (2, 1, 1)
+    assert result["results"][0] == {"watch_id": first, "started": False, "error": "unavailable"}
+    assert result["results"][1]["watch_id"] == second
+    assert result["results"][1]["started"] is True
+    assert store.state(first).phase == first_phase
+    assert store.state(second).phase == "triggered"
+    assert not receipts.exists()
+
+    monkeypatch.setattr(manager, operation, original)
+    result = service.retry_all_deliveries(store, manager)
+    assert (result["total"], result["started"], result["failed"]) == (1, 1, 0)
+    assert result["results"][0]["watch_id"] == first
+
+
+def test_retry_all_does_not_take_over_a_locked_watch(
+    context: tuple[Store, FakeSystemd, Path, Path], watches_by_phase: dict[str, str]
+) -> None:
+    """An occupied watch is reported without changing it or blocking other retries."""
+    store, manager, _, _ = context
+    watch_id = watches_by_phase["delivery_unknown"]
+    before = store.state(watch_id)
+    with file_lock(store.directory(watch_id) / "run.lock"):
+        result = service.retry_all_deliveries(store, manager)
+    assert (result["total"], result["started"], result["failed"]) == (2, 1, 1)
+    assert store.state(watch_id) == before
+    assert "占用" in next(item["error"] for item in result["results"] if not item["started"])
+
+
+def test_retry_start_error_does_not_rollback_an_acknowledged_runner(
+    context: tuple[Store, FakeSystemd, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A service-command error cannot undo a retry whose runner already started."""
+    store, manager, _, receipts = context
+    watch_id = arm(context, "raise AssertionError('must not run')")
+    with store.edit(watch_id) as state:
+        state.phase, state.summary = "delivery_unknown", "saved message"
+    original = manager.start
+
+    def start_then_error(unit: str) -> None:
+        """Acknowledge startup before simulating a failed service-command response."""
+        original(unit)
+        raise OSError("service response lost")
+
+    monkeypatch.setattr(manager, "start", start_then_error)
+    with pytest.raises(OSError, match="response lost"):
+        service.retry_delivery(store, manager, watch_id)
+    assert store.state(watch_id).phase == "triggered"
+    assert store.state(watch_id).started_at is not None
+    run_watch(store, watch_id, manager, threading.Event())
+    assert store.state(watch_id).phase == "queued"
+    assert json.loads(receipts.read_text())["message"] == "saved message"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["retry_delivery"],
+        ["retry_delivery", str(uuid4()), "--all"],
+        ["retry_delivery", "--all", str(uuid4())],
+        ["list", "--category", "running"],
+    ],
+)
+def test_cli_rejects_ambiguous_retry_targets_and_unknown_categories(arguments: list[str]) -> None:
+    """Callers must select one retry target and a documented category."""
+    with pytest.raises(SystemExit) as error:
+        cli.parser().parse_args(arguments)
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "arguments", [["list", "--category", "delivery_error"], ["retry_delivery", "--all"]]
+)
+def test_cli_empty_state_directory_is_a_successful_noop(
+    context: tuple[Store, FakeSystemd, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+) -> None:
+    """Empty listings and batch retries succeed without creating records or services."""
+    store, manager, _, _ = context
+    monkeypatch.setattr(cli, "get_manager", lambda: manager)
+    monkeypatch.setattr(sys, "argv", ["agent-wakeup", *arguments, "--state_dir", str(store.root)])
+    assert cli.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result == (
+        [] if arguments[0] == "list" else {"total": 0, "started": 0, "failed": 0, "results": []}
+    )
+    assert manager.calls == []
+    assert not store.root.exists()
