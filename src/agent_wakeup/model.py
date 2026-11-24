@@ -1,7 +1,10 @@
-"""Persisted watch configuration and execution state."""
+"""Persisted watch configuration, backend connection, and execution state."""
 
 import typing as t
 from dataclasses import dataclass
+
+Backend = t.Literal["codex", "antigravity"]
+BACKENDS: tuple[Backend, ...] = t.get_args(Backend)
 
 Phase = t.Literal[
     "waiting",
@@ -25,12 +28,36 @@ class WakeupError(Exception):
     """An actionable CLI or monitoring error."""
 
 
+@dataclass(frozen=True)
+class CodexConnection:
+    """Connection parameters for delivering messages to a Codex session."""
+
+    backend: t.Literal["codex"]
+    binary: str
+    codex_home: str
+
+
+@dataclass(frozen=True)
+class AntigravityConnection:
+    """Connection parameters for delivering messages to an Antigravity session."""
+
+    backend: t.Literal["antigravity"]
+    binary: str
+    ls_address: str
+    csrf_token: str
+
+
+Connection = CodexConnection | AntigravityConnection
+
+
 @dataclass
 class Config:
-    """A watch's immutable execution and delivery configuration."""
+    """A watch's immutable execution and session-binding configuration."""
 
     watch_id: str
     key: str
+    backend: Backend
+    session_id: str
     fingerprint: str
     probe_source: str
     probe_sha256: str
@@ -38,10 +65,6 @@ class Config:
     probe_args: list[str]
     cwd: str
     env: dict[str, str]
-    thread_id: str
-    codex_binary: str
-    codex_home: str
-    codex_remote: str | None
     project_dir: str
     uv_binary: str
     unit: str

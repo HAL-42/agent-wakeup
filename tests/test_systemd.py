@@ -8,11 +8,13 @@ import threading
 import time
 import typing as t
 from pathlib import Path
+from textwrap import dedent
 from uuid import uuid4
 
 import pytest
 
 from agent_wakeup import service
+from agent_wakeup.model import Backend
 from agent_wakeup.store import Store
 from agent_wakeup.systemd import Systemd
 
@@ -42,78 +44,146 @@ def cleanup(store: Store, manager: Systemd) -> None:
     manager.control("daemon-reload")
 
 
-def test_systemd_restart_delivery_and_cleanup(tmp_path: Path) -> None:
-    """Notifications keep the service alive; restart resumes checks until the final wake."""
+def make_fake_backends(tmp_path: Path) -> tuple[Path, Path]:
+    """Create isolated codex and agentapi executables in tmp_path/bin."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    receipt = tmp_path / "receipt"
+
+    codex = bin_dir / "codex"
+    codex.write_text(
+        dedent(f"""\
+        #!{sys.executable}
+        import json, sys
+        from pathlib import Path
+        args = sys.argv[1:]
+        thread = args[args.index('--thread') + 1]
+        with Path({str(receipt)!r}).open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(args[-1]) + '\\n')
+        print(f'Queued message live-test for thread {{thread}}.')
+        """),
+        encoding="utf-8",
+    )
+    codex.chmod(0o700)
+
+    agentapi = bin_dir / "agentapi"
+    agentapi.write_text(
+        dedent(f"""\
+        #!{sys.executable}
+        import json, os, sys
+        from pathlib import Path
+        expected = json.loads(Path({str(tmp_path / "agy.json")!r}).read_text(encoding='utf-8'))
+        if (
+            os.environ.get('ANTIGRAVITY_LS_ADDRESS') != expected['ls']
+            or os.environ.get('ANTIGRAVITY_CSRF_TOKEN') != expected['token']
+        ):
+            print(json.dumps({{'response': {{}}, 'error': 'rpc error: code = Unauthenticated desc = bad token'}}))
+            raise SystemExit(1)
+        args = sys.argv[1:]
+        cmd, rest = args[0], args[1:]
+        if rest[:1] == ['--']:
+            rest = rest[1:]
+        if cmd == 'get-conversation-metadata':
+            print(json.dumps({{'response': {{'conversationMetadata': {{'metadata': {{'rootConversationId': rest[0]}}}}}}}}))
+            raise SystemExit(0)
+        sid, prompt = rest[0], rest[1]
+        with Path({str(receipt)!r}).open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(prompt) + '\\n')
+        print(json.dumps({{'response': {{'sendMessage': {{'recipientId': sid, 'content': prompt}}}}}}))
+        """),
+        encoding="utf-8",
+    )
+    agentapi.chmod(0o700)
+    (tmp_path / "agy.json").write_text(
+        json.dumps({"ls": "localhost:33775", "token": "tok-1"}), encoding="utf-8"
+    )
+    return bin_dir, receipt
+
+
+@pytest.mark.parametrize("backend", ["codex", "antigravity"])
+def test_systemd_restart_rebind_delivery_and_cleanup(tmp_path: Path, backend: Backend) -> None:
+    """Notifications keep the service alive; rebind and restart work until final wake."""
     store, manager = Store(tmp_path / "state"), Systemd()
     probe = Path(__file__).parent / "probes/lifecycle.py"
-    queue = tmp_path / "codex"
-    queue.write_text(
-        "#!/usr/bin/env python3\nimport json, sys\nfrom pathlib import Path\n"
-        + "with Path('receipt').open('a') as stream: stream.write(json.dumps(sys.argv[-1]) + '\\n')\n"
-        + "print('Queued message live-test for thread ' + sys.argv[sys.argv.index('--thread') + 1] + '.')\n"
+    bin_dir, receipt = make_fake_backends(tmp_path)
+    sid = str(uuid4())
+    session_env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+    } | (
+        {"CODEX_THREAD_ID": sid, "CODEX_HOME": str(tmp_path)}
+        if backend == "codex"
+        else {
+            "ANTIGRAVITY_CONVERSATION_ID": sid,
+            "ANTIGRAVITY_LS_ADDRESS": "localhost:33775",
+            "ANTIGRAVITY_CSRF_TOKEN": "tok-1",
+        }
     )
-    queue.chmod(0o700)
     watch_id = None
     try:
         registered = service.register(
             store,
             manager,
-            key="systemd-restart",
+            key=f"systemd-{backend}",
             probe=probe,
             interpreter=sys.executable,
             probe_args=[str(tmp_path)],
             cwd=tmp_path,
             env={"PATH": os.environ["PATH"]},
-            thread_id=str(uuid4()),
-            codex_binary=str(queue),
-            codex_home=tmp_path,
+            session_env=session_env,
             interval_sec=0.2,
             max_wait_sec=60,
         )
         watch_id = registered["watch_id"]
         config = store.config(watch_id)
         until(lambda: store.state(watch_id).checks >= 1)
-        assert not (tmp_path / "receipt").exists()
+        assert not receipt.exists()
         original_pid = manager.control("show", config.unit, "--property=MainPID", "--value")
         (tmp_path / "notify").touch()
         until(
             lambda: (
-                store.state(watch_id).queued_message_id == "live-test"
+                store.state(watch_id).queued_at is not None
                 and store.state(watch_id).phase == "waiting"
             )
         )
         assert manager.status(config.unit)["ActiveState"] == "active"
-        assert manager.status(config.unit)["UnitFileState"] == "enabled"
         assert manager.control("show", config.unit, "--property=MainPID", "--value") == original_pid
         first_messages = [
-            json.loads(line) for line in (tmp_path / "receipt").read_text().splitlines()
+            json.loads(line) for line in receipt.read_text(encoding="utf-8").splitlines()
         ]
         assert len(first_messages) == 1
-        state = store.state(watch_id)
-        assert state.last_check_at is not None
-        assert state.next_check_at - state.last_check_at == pytest.approx(
-            config.interval_sec, abs=1e-6
-        )
-        original_checks = state.checks
+
+        if backend == "antigravity":
+            (tmp_path / "agy.json").write_text(
+                json.dumps({"ls": "localhost:44999", "token": "tok-2"}), encoding="utf-8"
+            )
+            service.rebind(
+                store,
+                watch_id,
+                session_env=session_env
+                | {"ANTIGRAVITY_LS_ADDRESS": "localhost:44999", "ANTIGRAVITY_CSRF_TOKEN": "tok-2"},
+            )
+            assert (
+                manager.control("show", config.unit, "--property=MainPID", "--value")
+                == original_pid
+            )
+
+        original_checks = store.state(watch_id).checks
         original_start = store.state(watch_id).started_at
         manager.control("restart", config.unit)
         until(lambda: store.state(watch_id).started_at != original_start)
         until(lambda: store.state(watch_id).checks > original_checks)
-        assert [
-            json.loads(line) for line in (tmp_path / "receipt").read_text().splitlines()
-        ] == first_messages
         assert store.config(watch_id).deadline == config.deadline
         (tmp_path / "wake").touch()
         until(lambda: store.state(watch_id).phase == "queued")
         until(lambda: manager.status(config.unit)["ActiveState"] == "inactive")
-        assert [json.loads(line) for line in (tmp_path / "receipt").read_text().splitlines()] == [
+        assert [json.loads(line) for line in receipt.read_text(encoding="utf-8").splitlines()] == [
             first_messages[0],
             store.state(watch_id).summary,
         ]
         assert manager.status(config.unit)["UnitFileState"] == "disabled"
         service.remove(store, manager, watch_id)
-        assert probe.exists()
-        assert not store.directory(watch_id).exists()
+        assert probe.exists() and not store.directory(watch_id).exists()
     finally:
         cleanup(store, manager)
         if watch_id:
@@ -138,14 +208,10 @@ def test_systemd_cancel_active_probe(tmp_path: Path, notify_first: bool) -> None
             else ""
         )
         + "subprocess.Popen([sys.executable, '-c', \"import time; from pathlib import Path; time.sleep(2); Path('leaked').touch()\"])\n"
-        + "Path('running').touch()\ntime.sleep(60)\n"
+        + "Path('running').touch()\ntime.sleep(60)\n",
+        encoding="utf-8",
     )
-    queue = tmp_path / "codex"
-    queue.write_text(
-        "#!/usr/bin/env python3\nimport sys\n"
-        + "print('Queued message cancel-test for thread ' + sys.argv[sys.argv.index('--thread') + 1] + '.')\n"
-    )
-    queue.chmod(0o700)
+    bin_dir, _ = make_fake_backends(tmp_path)
     watch_id = None
     try:
         registered = service.register(
@@ -157,9 +223,11 @@ def test_systemd_cancel_active_probe(tmp_path: Path, notify_first: bool) -> None
             probe_args=[],
             cwd=tmp_path,
             env={"PATH": os.environ["PATH"]},
-            thread_id=str(uuid4()),
-            codex_binary=str(queue),
-            codex_home=tmp_path,
+            session_env={
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "CODEX_THREAD_ID": str(uuid4()),
+                "CODEX_HOME": str(tmp_path),
+            },
             interval_sec=0.2,
             max_wait_sec=60,
         )

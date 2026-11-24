@@ -7,7 +7,7 @@ import time
 from jsonschema import ValidationError
 from loguru import logger
 
-from .delivery import send_codex
+from .delivery import deliver_message
 from .managers import ServiceManager
 from .model import TERMINAL, Config, WakeupError
 from .process import execute, parse_probe
@@ -30,7 +30,8 @@ def deliver(store: Store, config: Config, stopped: threading.Event) -> None:
         state.phase = "sending"
         state.delivery_attempts += 1
         attempt, prompt = state.delivery_attempts, state.summary
-    receipt = send_codex(config, prompt, directory, attempt, stopped)
+        connection = store.connection(config.watch_id)
+    receipt = deliver_message(config, connection, prompt, directory, attempt, stopped)
     with store.edit(config.watch_id) as state:
         state.phase = receipt.phase
         state.last_error = receipt.error
@@ -40,7 +41,7 @@ def deliver(store: Store, config: Config, stopped: threading.Event) -> None:
                 receipt.message_id,
                 time.time(),
             )
-            logger.info("{} queued message {}", config.watch_id, state.queued_message_id)
+            logger.info("{} queued message {}", config.watch_id, state.queued_message_id or "(ack)")
         else:
             logger.error("{}: {}", config.watch_id, state.last_error)
 

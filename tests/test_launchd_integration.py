@@ -43,7 +43,9 @@ def native_watch(
 ) -> t.Iterator[tuple[Store, Launchd, t.Callable[..., str], Path]]:
     """Register isolated LaunchAgents and unload only jobs created by this fixture."""
     store, manager = Store(tmp_path / "state"), Launchd()
-    queue = tmp_path / "codex"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    queue = bin_dir / "codex"
     queue.write_text(
         dedent("""\
         #!/usr/bin/env python3
@@ -52,13 +54,14 @@ def native_watch(
 
         thread = sys.argv[sys.argv.index('--thread') + 1]
         prompt = sys.argv[sys.argv.index('--message') + 1]
-        with Path('receipts').open('a') as stream:
+        with Path('receipts').open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(prompt) + '\\n')
         if Path('bad-ack').exists():
             print('receipt unavailable')
         else:
             print(f'Queued message mac-test-{time.time_ns()} for thread {thread}.')
-        """)
+        """),
+        encoding="utf-8",
     )
     queue.chmod(0o700)
     thread = str(uuid4())
@@ -66,7 +69,7 @@ def native_watch(
     def register(code: str, **options: t.Any) -> str:
         """Start a watch with short test intervals and a fake message destination."""
         probe = tmp_path / "probe.py"
-        probe.write_text(code)
+        probe.write_text(code, encoding="utf-8")
         return service.register(
             store,
             manager,
@@ -78,9 +81,11 @@ def native_watch(
                     "probe_args": [],
                     "cwd": tmp_path,
                     "env": {"PATH": os.environ["PATH"]},
-                    "thread_id": thread,
-                    "codex_binary": str(queue),
-                    "codex_home": tmp_path,
+                    "session_env": {
+                        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                        "CODEX_THREAD_ID": thread,
+                        "CODEX_HOME": str(tmp_path),
+                    },
                     "interval_sec": 0.2,
                     "probe_timeout_sec": 10,
                     "queue_timeout_sec": 10,
@@ -97,7 +102,7 @@ def native_watch(
             manager.stop(store.config(watch_id).unit)
 
 
-PHASE_PROBE = (Path(__file__).parent / "probes/lifecycle.py").read_text()
+PHASE_PROBE = (Path(__file__).parent / "probes/lifecycle.py").read_text(encoding="utf-8")
 
 
 def test_launchd_lifecycle(native_watch: tuple[Store, Launchd, t.Callable[..., str], Path]) -> None:
@@ -121,7 +126,8 @@ def test_launchd_lifecycle(native_watch: tuple[Store, Launchd, t.Callable[..., s
     assert manager.status(config.unit)["pid"] == first_pid
     assert manager.plist_path(config.unit).exists()
     first_messages = [
-        json.loads(line) for line in (directory / "receipts").read_text().splitlines()
+        json.loads(line)
+        for line in (directory / "receipts").read_text(encoding="utf-8").splitlines()
     ]
     assert len(first_messages) == 1
     original_checks = store.state(watch_id).checks
@@ -136,17 +142,18 @@ def test_launchd_lifecycle(native_watch: tuple[Store, Launchd, t.Callable[..., s
     assert store.state(watch_id).started_at != first_started_at
     assert store.config(watch_id).deadline == config.deadline
     assert [
-        json.loads(line) for line in (directory / "receipts").read_text().splitlines()
+        json.loads(line)
+        for line in (directory / "receipts").read_text(encoding="utf-8").splitlines()
     ] == first_messages
 
     (directory / "wake").touch()
     until(lambda: store.state(watch_id).phase == "queued")
     until(lambda: not manager.is_running(config.unit))
     assert not manager.plist_path(config.unit).exists()
-    assert [json.loads(line) for line in (directory / "receipts").read_text().splitlines()] == [
-        first_messages[0],
-        store.state(watch_id).summary,
-    ]
+    assert [
+        json.loads(line)
+        for line in (directory / "receipts").read_text(encoding="utf-8").splitlines()
+    ] == [first_messages[0], store.state(watch_id).summary]
     assert register(PHASE_PROBE, probe_args=[str(directory)]) == watch_id
     assert not manager.plist_path(config.unit).exists()
     service.remove(store, manager, watch_id)
@@ -169,15 +176,14 @@ def test_launchd_retry_saved_notification(
     saved_message = store.state(watch_id).summary
     (directory / "bad-ack").unlink()
     (directory / "wake").touch()
-    service.retry_delivery(store, manager, watch_id)
+    service.retry_delivery(store, manager, watch_id, session_env={})
     until(lambda: store.state(watch_id).phase == "queued")
     until(lambda: not manager.is_running(config.unit))
     assert store.config(watch_id).deadline == config.deadline
-    assert [json.loads(line) for line in (directory / "receipts").read_text().splitlines()] == [
-        saved_message,
-        saved_message,
-        store.state(watch_id).summary,
-    ]
+    assert [
+        json.loads(line)
+        for line in (directory / "receipts").read_text(encoding="utf-8").splitlines()
+    ] == [saved_message, saved_message, store.state(watch_id).summary]
 
 
 BLOCKING_PROBE = dedent("""\
@@ -213,7 +219,7 @@ def test_launchd_stops_probe_children(
     )
     config = store.config(watch_id)
     until(lambda: (directory / "running.json").exists())
-    pids = json.loads((directory / "running.json").read_text())
+    pids = json.loads((directory / "running.json").read_text(encoding="utf-8"))
     if action == "cancel":
         service.cancel(store, manager, watch_id)
         expected = "cancelled"
@@ -233,7 +239,7 @@ def test_launchd_recovers_from_sigkill(
     watch_id = register(BLOCKING_PROBE, probe_timeout_sec=60)
     config = store.config(watch_id)
     until(lambda: (directory / "running.json").exists())
-    pids = json.loads((directory / "running.json").read_text())
+    pids = json.loads((directory / "running.json").read_text(encoding="utf-8"))
     started = store.state(watch_id).started_at
     manager.control("kill", "SIGKILL", f"{manager.domain}/{config.unit}")
     (directory / "ready").touch()

@@ -12,7 +12,14 @@ from dataclasses import asdict
 from pathlib import Path
 from uuid import UUID
 
-from .model import Config, State, WakeupError
+from .model import (
+    AntigravityConnection,
+    CodexConnection,
+    Config,
+    Connection,
+    State,
+    WakeupError,
+)
 
 
 def atomic_json(path: Path, value: dict[str, t.Any]) -> None:
@@ -86,28 +93,50 @@ class Store:
 
     def config(self, watch_id: str) -> Config:
         """Read a watch's immutable configuration."""
-        return Config(**json.loads((self.directory(watch_id) / "config.json").read_text()))
+        return Config(
+            **json.loads((self.directory(watch_id) / "config.json").read_text(encoding="utf-8"))
+        )
+
+    def connection(self, watch_id: str) -> Connection:
+        """Read a watch's latest persisted delivery connection."""
+        data = json.loads(
+            (self.directory(watch_id) / "connection.json").read_text(encoding="utf-8")
+        )
+        return (
+            CodexConnection(**data) if data["backend"] == "codex" else AntigravityConnection(**data)
+        )
+
+    def save_connection(self, watch_id: str, connection: Connection) -> None:
+        """Atomically replace a watch's delivery connection under its state lock."""
+        directory = self.directory(watch_id)
+        with file_lock(directory / "state.lock"):
+            atomic_json(directory / "connection.json", asdict(connection))
 
     def state(self, watch_id: str) -> State:
         """Read the latest complete state record."""
-        return State(**json.loads((self.directory(watch_id) / "state.json").read_text()))
+        return State(
+            **json.loads((self.directory(watch_id) / "state.json").read_text(encoding="utf-8"))
+        )
 
     @contextmanager
-    def edit(self, watch_id: str) -> t.Iterator[State]:
+    def edit(self, watch_id: str, *, connection: Connection | None = None) -> t.Iterator[State]:
         """Serialize a short state transition and persist it on success."""
         directory = self.directory(watch_id)
         with file_lock(directory / "state.lock"):
             state = self.state(watch_id)
             yield state
+            if connection is not None:
+                atomic_json(directory / "connection.json", asdict(connection))
             state.updated_at = time.time()
             atomic_json(directory / "state.json", asdict(state))
 
-    def create(self, config: Config, probe: bytes) -> None:
+    def create(self, config: Config, connection: Connection, probe: bytes) -> None:
         """Publish a complete registration under the caller's registry lock."""
         directory = self.directory(config.watch_id)
         staging = Path(tempfile.mkdtemp(prefix=".register-", dir=self.root))
         try:
             atomic_json(staging / "config.json", asdict(config))
+            atomic_json(staging / "connection.json", asdict(connection))
             atomic_json(staging / "state.json", asdict(State(updated_at=config.created_at)))
             snapshot = staging / "probe"
             with snapshot.open("wb") as stream:

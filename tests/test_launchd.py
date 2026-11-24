@@ -1,5 +1,6 @@
 """LaunchAgent contracts exercised without contacting a macOS service manager."""
 
+import os
 import plistlib
 import subprocess
 import sys
@@ -70,8 +71,15 @@ def launch_context(tmp_path: Path) -> tuple[Store, FakeLaunchd, dict[str, t.Any]
     """Supply the same registration inputs for initial and repeated registrations."""
     store = Store(tmp_path / "state")
     manager = FakeLaunchd(store, tmp_path / "LaunchAgents")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    codex = bin_dir / "codex"
+    codex.write_text(
+        f"#!{sys.executable}\nprint('Usage: codex queue --thread <UUID>')\n", encoding="utf-8"
+    )
+    codex.chmod(0o700)
     probe = tmp_path / "probe.py"
-    probe.write_text('print(\'{"state":"wait","summary":"waiting"}\')\n')
+    probe.write_text('print(\'{"state":"wait","summary":"waiting"}\')\n', encoding="utf-8")
     arguments = {
         "key": "mac-example",
         "probe": probe,
@@ -79,9 +87,11 @@ def launch_context(tmp_path: Path) -> tuple[Store, FakeLaunchd, dict[str, t.Any]
         "probe_args": [],
         "cwd": tmp_path,
         "env": {"EXAMPLE_VARIABLE": "probe-only"},
-        "thread_id": str(uuid4()),
-        "codex_binary": sys.executable,
-        "codex_home": tmp_path / "codex",
+        "session_env": {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "CODEX_THREAD_ID": str(uuid4()),
+            "CODEX_HOME": str(tmp_path / "codex"),
+        },
     }
     return store, manager, arguments
 
@@ -219,8 +229,7 @@ def test_retry_cancel_and_remove(
             "probe_notify",
         )
     manager.finish(unit)
-    # Keep the old PID visible to emulate a process just finishing its exit.
-    service.retry_delivery(store, manager, watch_id)
+    service.retry_delivery(store, manager, watch_id, session_env={})
     assert manager.plist_path(unit).exists()
     assert ("bootout", f"gui/501/{unit}") in manager.calls
     assert len([call for call in manager.calls if call[0] == "bootstrap"]) == 2
@@ -313,10 +322,10 @@ def test_finish_rejects_foreign_paths(tmp_path: Path) -> None:
     """A malformed saved identifier cannot delete another file."""
     manager = Launchd(tmp_path / "LaunchAgents", uid=501)
     other = tmp_path / "other.plist"
-    other.write_text("unrelated")
+    other.write_text("unrelated", encoding="utf-8")
     with pytest.raises(WakeupError):
         manager.finish("../other")
-    assert other.read_text() == "unrelated"
+    assert other.read_text(encoding="utf-8") == "unrelated"
 
 
 @pytest.mark.parametrize("platform_name,expected", [("linux", Systemd), ("darwin", Launchd)])
@@ -330,9 +339,10 @@ def test_platform_selection(
 
 def test_launchd_doctor(launch_context: tuple[Store, FakeLaunchd, dict[str, t.Any]]) -> None:
     """Platform diagnostics query the GUI domain without starting any jobs."""
-    store, manager, _ = launch_context
-    checks = doctor(store, manager)
+    store, manager, arguments = launch_context
+    checks = doctor(store, manager, session_env=arguments["session_env"])
     assert checks["user_manager"] == "gui/501"
     assert checks["service_manager"] == "launchd"
+    assert checks["healthy"] is True
     assert "linger" not in checks
     assert manager.calls == [("print", "gui/501")]

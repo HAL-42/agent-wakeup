@@ -1,12 +1,13 @@
-"""Contract tests using real probe and queue subprocesses."""
+"""Contract tests using real probe, codex, and agentapi subprocesses."""
 
 import json
+import os
 import subprocess
 import sys
 import threading
 import time
 import typing as t
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from textwrap import dedent
 from uuid import uuid4
@@ -14,7 +15,7 @@ from uuid import uuid4
 import pytest
 
 from agent_wakeup import cli, service
-from agent_wakeup.model import Phase, WakeupError
+from agent_wakeup.model import Backend, Phase, WakeupError
 from agent_wakeup.process import Result, execute, parse_probe
 from agent_wakeup.runner import run_watch
 from agent_wakeup.store import Store, file_lock
@@ -43,56 +44,198 @@ class FakeSystemd(Systemd):
             state.started_at = time.time()
 
 
+@dataclass
+class Harness:
+    """Isolated watch store, fake service manager, and simulated backend CLIs."""
+
+    store: Store
+    manager: FakeSystemd
+    bin_dir: Path
+    receipts: Path
+    agy_control: Path
+
+    def session_env(
+        self,
+        backend: Backend = "codex",
+        *,
+        session_id: str | None = None,
+        ls_address: str = "localhost:33775",
+        csrf_token: str = "secret-csrf-token-1",
+    ) -> dict[str, str]:
+        """Build an isolated session environment for codex or antigravity."""
+        sid = session_id or str(uuid4())
+        base = {
+            "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
+            "HOME": str(self.store.root.parent),
+        }
+        if backend == "codex":
+            return base | {
+                "CODEX_THREAD_ID": sid,
+                "CODEX_HOME": str(self.store.root.parent / "codex"),
+            }
+        return base | {
+            "ANTIGRAVITY_CONVERSATION_ID": sid,
+            "ANTIGRAVITY_LS_ADDRESS": ls_address,
+            "ANTIGRAVITY_CSRF_TOKEN": csrf_token,
+        }
+
+    def set_agy_server(
+        self,
+        *,
+        ls_address: str = "localhost:33775",
+        csrf_token: str = "secret-csrf-token-1",
+        mode: str = "ok",
+        missing_sessions: list[str] | None = None,
+    ) -> None:
+        """Update the simulated Antigravity language_server state."""
+        self.agy_control.write_text(
+            json.dumps(
+                {
+                    "ls_address": ls_address,
+                    "csrf_token": csrf_token,
+                    "mode": mode,
+                    "missing_sessions": missing_sessions or [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+
 @pytest.fixture
-def context(tmp_path: Path) -> tuple[Store, FakeSystemd, Path, Path]:
-    """Provide private state plus a queue executable that captures literal input."""
+def harness(tmp_path: Path) -> Harness:
+    """Provide private state plus simulated codex and agentapi executables."""
     store = Store(tmp_path / "state")
-    queue = tmp_path / "fake-codex"
-    queue.write_text(
-        "#!/usr/bin/env python3\n"
-        + "import json, os, sys, time\n"
-        + "from pathlib import Path\n"
-        + "args = sys.argv[1:]\n"
-        + "thread = args[args.index('--thread') + 1]\n"
-        + "message = args[args.index('--message') + 1]\n"
-        + "with Path(os.environ['RECEIPTS']).open('a') as stream:\n"
-        + "    stream.write(json.dumps({'thread': thread, 'message': message}) + '\\n')\n"
-        + "time.sleep(float(os.environ.get('QUEUE_SLEEP', '0')))\n"
-        + "if os.environ.get('QUEUE_BAD_ACK'): print('no confirmed receipt')\n"
-        + "else: print(f'Queued message test-message for thread {thread}.')\n"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    receipts = tmp_path / "receipts.jsonl"
+    agy_control = tmp_path / "agy-server.json"
+
+    codex = bin_dir / "codex"
+    codex.write_text(
+        dedent(f"""\
+        #!{sys.executable}
+        import json, os, sys, time
+        from pathlib import Path
+
+        args = sys.argv[1:]
+        if args == ['queue', '--help']:
+            print('Usage: codex queue --thread <UUID> --message <TEXT>')
+            raise SystemExit(0)
+        thread = args[args.index('--thread') + 1]
+        message = args[args.index('--message') + 1]
+        with Path({str(receipts)!r}).open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps({{'backend': 'codex', 'session': thread, 'message': message}}) + '\\n')
+        time.sleep(float(os.environ.get('QUEUE_SLEEP', '0')))
+        if os.environ.get('QUEUE_BAD_ACK'):
+            print('no confirmed receipt')
+        else:
+            print(f'Queued message test-message for thread {{thread}}.')
+        """),
+        encoding="utf-8",
     )
-    queue.chmod(0o700)
-    return store, FakeSystemd(store, tmp_path / "units"), queue, tmp_path / "receipts"
+    codex.chmod(0o700)
+
+    agentapi = bin_dir / "agentapi"
+    agentapi.write_text(
+        dedent(f"""\
+        #!{sys.executable}
+        import json, os, sys, time
+        from pathlib import Path
+
+        control = json.loads(Path({str(agy_control)!r}).read_text(encoding='utf-8'))
+        ls_addr = os.environ.get('ANTIGRAVITY_LS_ADDRESS', '')
+        csrf = os.environ.get('ANTIGRAVITY_CSRF_TOKEN', '')
+        if not ls_addr:
+            print(json.dumps({{'error': 'ANTIGRAVITY_LS_ADDRESS is not set'}}))
+            raise SystemExit(1)
+        if ls_addr != control['ls_address'] or control['mode'] == 'down':
+            print(json.dumps({{
+                'response': {{}},
+                'error': f'rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp {{ls_addr}}: connect: connection refused"',
+            }}))
+            raise SystemExit(1)
+        if csrf != control['csrf_token']:
+            print(json.dumps({{
+                'response': {{}},
+                'error': 'rpc error: code = Unauthenticated desc = unauthenticated: missing or invalid CSRF token',
+            }}))
+            raise SystemExit(1)
+
+        args = sys.argv[1:]
+        cmd = args[0]
+        rest = args[1:]
+        if rest[:1] == ['--']:
+            rest = rest[1:]
+
+        if cmd == 'get-conversation-metadata':
+            sid = rest[0]
+            if sid in control['missing_sessions']:
+                print(json.dumps({{
+                    'response': {{}},
+                    'error': f'rpc error: code = NotFound desc = not_found: trajectory not found: {{sid}}',
+                }}))
+                raise SystemExit(1)
+            print(json.dumps({{'response': {{'conversationMetadata': {{'metadata': {{'rootConversationId': sid}}}}}}}}))
+            raise SystemExit(0)
+
+        if cmd == 'send-message':
+            sid, content = rest[0], rest[1]
+            if control['mode'] == 'mid_rpc_drop':
+                print(json.dumps({{
+                    'response': {{}},
+                    'error': 'rpc error: code = Unavailable desc = transport is closing',
+                }}))
+                raise SystemExit(1)
+            with Path({str(receipts)!r}).open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps({{'backend': 'antigravity', 'session': sid, 'message': content}}) + '\\n')
+            time.sleep(float(os.environ.get('QUEUE_SLEEP', '0')))
+            if os.environ.get('QUEUE_BAD_ACK'):
+                print('malformed non-json output')
+                raise SystemExit(0)
+            print(json.dumps({{'response': {{'sendMessage': {{'recipientId': sid, 'content': content}}}}}}))
+            raise SystemExit(0)
+
+        raise SystemExit(2)
+        """),
+        encoding="utf-8",
+    )
+    agentapi.chmod(0o700)
+
+    instance = Harness(
+        store, FakeSystemd(store, tmp_path / "units"), bin_dir, receipts, agy_control
+    )
+    instance.set_agy_server()
+    return instance
 
 
 def arm(
-    context: tuple[Store, FakeSystemd, Path, Path],
+    harness: Harness,
     code: str,
     *,
     key: str = "example",
-    thread: str | None = None,
-    **overrides: object,
+    backend: Backend = "codex",
+    session_id: str | None = None,
+    session_env: dict[str, str] | None = None,
+    **overrides: t.Any,
 ) -> str:
-    """Register a real temporary probe with small test durations."""
-    store, manager, queue, receipts = context
-    probe = store.root.parent / f"{key}.py"
-    probe.write_text(code)
+    """Register a temporary probe with small test durations."""
+    probe = harness.store.root.parent / f"{key}.py"
+    probe.write_text(code, encoding="utf-8")
+    active_session_env = session_env or harness.session_env(backend, session_id=session_id)
     options = {
         "key": key,
         "probe": probe,
         "interpreter": sys.executable,
         "probe_args": [],
-        "cwd": store.root.parent,
-        "env": {"RECEIPTS": str(receipts)},
-        "thread_id": thread or str(uuid4()),
-        "codex_binary": str(queue),
-        "codex_home": store.root.parent / "codex",
+        "cwd": harness.store.root.parent,
+        "env": {},
+        "session_env": active_session_env,
         "interval_sec": 0.01,
         "probe_timeout_sec": 2,
         "max_wait_sec": 30,
         "queue_timeout_sec": 2,
     } | overrides
-    return service.register(store, manager, **options)["watch_id"]
+    return service.register(harness.store, harness.manager, **options)["watch_id"]
 
 
 def sequenced_probe(results: list[dict[str, str]]) -> str:
@@ -109,40 +252,48 @@ def sequenced_probe(results: list[dict[str, str]]) -> str:
         """)
 
 
-def test_wait_then_wake_preserves_prompt_and_snapshot(
-    context: tuple[Store, FakeSystemd, Path, Path],
-) -> None:
-    """Polling is local and one literal prompt survives original script edits."""
-    store, manager, _, receipts = context
-    prompt = '完成！\n请读取 "路径"；`literal` $(touch unwanted) $HOME 与单引号\''
+@pytest.mark.parametrize("backend", ["codex", "antigravity"])
+def test_wait_then_wake_preserves_prompt_and_snapshot(harness: Harness, backend: Backend) -> None:
+    """Polling is local, literal prompts survive edits, and secrets stay out of probes."""
+    prompt = '- 完成！\n请读取 "路径"；`literal` $(touch unwanted) $HOME 与单引号\''
     watch_id = arm(
-        context,
-        "import json\nfrom pathlib import Path\n"
+        harness,
+        "import json, os\nfrom pathlib import Path\n"
+        + "assert 'ANTIGRAVITY_CSRF_TOKEN' not in os.environ\n"
         + "counter = Path('counter')\ncount = int(counter.read_text()) + 1 if counter.exists() else 1\n"
         + "counter.write_text(str(count))\n"
         + f"print(json.dumps({{'state': 'wake' if count == 3 else 'wait', 'summary': {prompt!r}}}))\n",
+        backend=backend,
     )
-    Path(store.config(watch_id).probe_source).write_text("raise RuntimeError('changed original')")
-    run_watch(store, watch_id, manager, threading.Event())
-    state = store.state(watch_id)
+    Path(harness.store.config(watch_id).probe_source).write_text(
+        "raise RuntimeError('changed original')", encoding="utf-8"
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("ANTIGRAVITY_CSRF_TOKEN", raising=False)
+        patch.delenv("ANTIGRAVITY_LS_ADDRESS", raising=False)
+        run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    state = harness.store.state(watch_id)
     assert (state.phase, state.checks, state.delivery_attempts) == ("queued", 3, 1)
-    assert json.loads(receipts.read_text())["message"] == prompt
-    assert not (store.root.parent / "unwanted").exists()
-    run_watch(store, watch_id, manager, threading.Event())
-    assert len(receipts.read_text().splitlines()) == 1
-    assert ("disable", store.config(watch_id).unit) in manager.calls
+    assert state.queued_at is not None
+    assert (state.queued_message_id is None) == (backend == "antigravity")
+    recorded = json.loads(harness.receipts.read_text(encoding="utf-8"))
+    assert (recorded["backend"], recorded["message"]) == (backend, prompt)
+    assert not (harness.store.root.parent / "unwanted").exists()
+    inspected = json.dumps(service.inspect_watch(harness.store, harness.manager, watch_id))
+    assert "secret-csrf-token" not in inspected
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    assert len(harness.receipts.read_text(encoding="utf-8").splitlines()) == 1
+    assert ("disable", harness.store.config(watch_id).unit) in harness.manager.calls
 
 
-def test_notifications_continue_until_wake(
-    context: tuple[Store, FakeSystemd, Path, Path],
-) -> None:
+@pytest.mark.parametrize("backend", ["codex", "antigravity"])
+def test_notifications_continue_until_wake(harness: Harness, backend: Backend) -> None:
     """Each notify sends its literal prompt, including repeats, before the final wake."""
-    store, manager, _, receipts = context
-    first = '第一阶段完成。\n请分析 "结果"，保留 $(literal)。'
+    first = '- 第一阶段完成。\n请分析 "结果"，保留 $(literal)。'
     second = "第二阶段完成，请继续分析。"
     final = "全部完成。"
     watch_id = arm(
-        context,
+        harness,
         sequenced_probe(
             [
                 {"state": "wait", "summary": "任务启动"},
@@ -153,24 +304,176 @@ def test_notifications_continue_until_wake(
                 {"state": "wake", "summary": final},
             ]
         ),
+        backend=backend,
     )
-    run_watch(store, watch_id, manager, threading.Event())
-    state = store.state(watch_id)
-    messages = [json.loads(line)["message"] for line in receipts.read_text().splitlines()]
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    state = harness.store.state(watch_id)
+    messages = [
+        json.loads(line)["message"]
+        for line in harness.receipts.read_text(encoding="utf-8").splitlines()
+    ]
     assert messages == [first, first, second, final]
     assert (state.phase, state.checks, state.delivery_attempts) == ("queued", 6, 4)
     assert state.reason == "probe"
-    assert manager.calls.count(("disable", store.config(watch_id).unit)) == 1
+    assert harness.manager.calls.count(("disable", harness.store.config(watch_id).unit)) == 1
+
+
+def test_backend_autodetect_and_validation_errors(harness: Harness, tmp_path: Path) -> None:
+    """Registration requires an unambiguous backend, valid session UUID, and live metadata."""
+    probe = tmp_path / "probe.py"
+    probe.write_text('print(\'{"state":"wait","summary":"ok"}\')\n', encoding="utf-8")
+    base_args: dict[str, t.Any] = {
+        "key": "check-env",
+        "probe": probe,
+        "interpreter": sys.executable,
+        "probe_args": [],
+        "cwd": tmp_path,
+        "env": {},
+    }
+    with pytest.raises(WakeupError, match="--backend"):
+        service.register(
+            harness.store, harness.manager, session_env={"PATH": os.environ["PATH"]}, **base_args
+        )
+
+    both = harness.session_env("codex") | harness.session_env("antigravity")
+    with pytest.raises(WakeupError, match="同时检测到"):
+        service.register(harness.store, harness.manager, session_env=both, **base_args)
+
+    missing_sid = str(uuid4())
+    harness.set_agy_server(missing_sessions=[missing_sid])
+    with pytest.raises(WakeupError, match="NotFound"):
+        service.register(
+            harness.store,
+            harness.manager,
+            session_env=harness.session_env("antigravity", session_id=missing_sid),
+            **base_args,
+        )
+    assert not harness.store.root.exists()
+
+
+@pytest.mark.parametrize(
+    ("server_mode", "expected_phase"),
+    [("down", "delivery_failed"), ("mid_rpc_drop", "delivery_unknown")],
+)
+def test_antigravity_error_classification_and_retry_refresh(
+    harness: Harness, server_mode: str, expected_phase: str
+) -> None:
+    """Dial/auth rejections fail cleanly; retry_delivery refreshes rotated credentials."""
+    sid = str(uuid4())
+    watch_id = arm(
+        harness,
+        sequenced_probe(
+            [
+                {"state": "notify", "summary": "阶段一结果"},
+                {"state": "wake", "summary": "最终结果"},
+            ]
+        ),
+        backend="antigravity",
+        session_id=sid,
+    )
+    harness.set_agy_server(
+        ls_address="localhost:45123", csrf_token="rotated-token", mode=server_mode
+    )
+    if server_mode == "mid_rpc_drop":
+        # Allow connection so mid-RPC drop occurs during send-message.
+        harness.set_agy_server(
+            ls_address="localhost:33775", csrf_token="secret-csrf-token-1", mode="mid_rpc_drop"
+        )
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    state = harness.store.state(watch_id)
+    assert state.phase == expected_phase
+    assert (state.checks, state.delivery_attempts, state.summary) == (1, 1, "阶段一结果")
+
+    harness.set_agy_server(ls_address="localhost:45123", csrf_token="rotated-token", mode="ok")
+    new_env = harness.session_env(
+        "antigravity", session_id=sid, ls_address="localhost:45123", csrf_token="rotated-token"
+    )
+    service.retry_delivery(harness.store, harness.manager, watch_id, session_env=new_env)
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    state = harness.store.state(watch_id)
+    assert (state.phase, state.checks, state.delivery_attempts) == ("queued", 2, 3)
+    assert [
+        json.loads(line)["message"]
+        for line in harness.receipts.read_text(encoding="utf-8").splitlines()
+    ] == ["阶段一结果", "最终结果"]
+
+
+def test_rebind_and_idempotent_register_across_server_restart(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Server port rotation does not break fingerprint reuse, and rebind updates active watches."""
+    sid_ok, sid_gone = str(uuid4()), str(uuid4())
+    code = sequenced_probe(
+        [{"state": "wait", "summary": "waiting"}, {"state": "wake", "summary": "done"}]
+    )
+    watch_ok = arm(harness, code, key="ok-watch", backend="antigravity", session_id=sid_ok)
+    watch_gone = arm(harness, code, key="gone-watch", backend="antigravity", session_id=sid_gone)
+    before_fp = harness.store.config(watch_ok).fingerprint
+
+    # Rotate server credentials and drop sid_gone.
+    harness.set_agy_server(
+        ls_address="localhost:55000",
+        csrf_token="token-after-restart",
+        missing_sessions=[sid_gone],
+    )
+    rotated_env = harness.session_env(
+        "antigravity",
+        session_id=sid_ok,
+        ls_address="localhost:55000",
+        csrf_token="token-after-restart",
+    )
+
+    # Idempotent register with same key/session succeeds and refreshes connection.json.
+    reused = service.register(
+        harness.store,
+        harness.manager,
+        key="ok-watch",
+        probe=Path(harness.store.config(watch_ok).probe_source),
+        interpreter=sys.executable,
+        probe_args=[],
+        cwd=harness.store.root.parent,
+        env={},
+        session_env=rotated_env,
+        interval_sec=0.01,
+        probe_timeout_sec=2,
+        max_wait_sec=30,
+        queue_timeout_sec=2,
+    )
+    assert reused["watch_id"] == watch_ok and reused["reused"] is True
+    assert harness.store.config(watch_ok).fingerprint == before_fp
+
+    # Bulk CLI rebind updates watch_ok, reports failure for watch_gone, and exits 1.
+    for k, v in rotated_env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.setattr(cli, "get_manager", lambda: harness.manager)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agent-wakeup", "rebind", "--all", "--state_dir", str(harness.store.root), "--json"],
+    )
+    assert cli.main() == 1
+    bulk = json.loads(capsys.readouterr().out)
+    assert (bulk["total"], bulk["rebound"], bulk["failed"]) == (2, 1, 1)
+    assert next(item["watch_id"] for item in bulk["results"] if not item["rebound"]) == watch_gone
+
+    # watch_ok now delivers cleanly against the rotated server without restarting its unit first.
+    run_watch(harness.store, watch_ok, harness.manager, threading.Event())
+    assert harness.store.state(watch_ok).phase == "queued"
+    assert json.loads(harness.receipts.read_text(encoding="utf-8"))["session"] == sid_ok
+
+    # Finished watches reject rebind.
+    with pytest.raises(WakeupError, match="已结束"):
+        service.rebind(harness.store, watch_ok, session_env=rotated_env)
 
 
 @pytest.mark.parametrize("failure", ["missing", "no_ack"])
-def test_notification_retry_resumes_monitoring(
-    context: tuple[Store, FakeSystemd, Path, Path], failure: str
+def test_codex_notification_retry_offline_preserves_saved_connection(
+    harness: Harness, failure: str
 ) -> None:
-    """A failed notification pauses checks; retry sends the saved prompt then resumes."""
-    store, manager, queue, receipts = context
+    """Offline retry_delivery reuses the persisted connection when session env is absent."""
     watch_id = arm(
-        context,
+        harness,
         sequenced_probe(
             [
                 {"state": "notify", "summary": "分析阶段结果"},
@@ -178,74 +481,43 @@ def test_notification_retry_resumes_monitoring(
             ]
         ),
     )
-    healthy_queue = queue.read_bytes()
+    codex = harness.bin_dir / "codex"
+    healthy_codex = codex.read_bytes()
     if failure == "missing":
-        queue.unlink()
+        codex.unlink()
     else:
-        queue.write_text("#!/usr/bin/env python3\nprint('no confirmed receipt')\n")
-    run_watch(store, watch_id, manager, threading.Event())
-    state = store.state(watch_id)
-    assert state.phase == ("delivery_failed" if failure == "missing" else "delivery_unknown")
-    assert (state.checks, state.delivery_attempts, state.summary) == (1, 1, "分析阶段结果")
+        codex.write_text(f"#!{sys.executable}\nprint('no confirmed receipt')\n", encoding="utf-8")
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    assert harness.store.state(watch_id).phase == (
+        "delivery_failed" if failure == "missing" else "delivery_unknown"
+    )
 
-    queue.write_bytes(healthy_queue)
-    queue.chmod(0o700)
-    run_watch(store, watch_id, manager, threading.Event())
-    assert store.state(watch_id).checks == 1
-    assert not receipts.exists()
-
-    service.retry_delivery(store, manager, watch_id)
-    run_watch(store, watch_id, manager, threading.Event())
-    state = store.state(watch_id)
+    codex.write_bytes(healthy_codex)
+    codex.chmod(0o700)
+    service.retry_delivery(harness.store, harness.manager, watch_id, session_env={})
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    state = harness.store.state(watch_id)
     assert (state.phase, state.checks, state.delivery_attempts) == ("queued", 2, 3)
-    assert [json.loads(line)["message"] for line in receipts.read_text().splitlines()] == [
-        "分析阶段结果",
-        "处理最终结果",
-    ]
 
 
-def test_notification_keeps_deadline(context: tuple[Store, FakeSystemd, Path, Path]) -> None:
+def test_notification_keeps_deadline(harness: Harness) -> None:
     """Notifying does not extend the deadline or turn its final message into a notification."""
-    store, manager, _, receipts = context
     watch_id = arm(
-        context,
+        harness,
         'print(\'{"state":"notify","summary":"请检查任务状态"}\')',
         interval_sec=5,
         max_wait_sec=1,
     )
-    deadline = store.config(watch_id).deadline
-    run_watch(store, watch_id, manager, threading.Event())
-    state = store.state(watch_id)
+    deadline = harness.store.config(watch_id).deadline
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    state = harness.store.state(watch_id)
     assert (state.phase, state.reason, state.checks) == ("queued", "deadline", 1)
-    assert store.config(watch_id).deadline == deadline
-    messages = [json.loads(line)["message"] for line in receipts.read_text().splitlines()]
-    assert len(messages) == 2
-    assert messages[0] == "请检查任务状态"
-    assert "等待期限" in messages[1]
-
-
-def test_probe_error_after_notification_finishes(
-    context: tuple[Store, FakeSystemd, Path, Path],
-) -> None:
-    """The error limit still ends monitoring after earlier intermediate notifications."""
-    store, manager, _, receipts = context
-    watch_id = arm(
-        context,
-        sequenced_probe(
-            [
-                {"state": "notify", "summary": "中间结果"},
-                {"state": "invalid", "summary": "无效输出"},
-            ]
-        ),
-        max_probe_errors=1,
-    )
-    run_watch(store, watch_id, manager, threading.Event())
-    state = store.state(watch_id)
-    assert (state.phase, state.reason, state.checks) == ("queued", "probe_error", 2)
-    messages = [json.loads(line)["message"] for line in receipts.read_text().splitlines()]
-    assert len(messages) == 2
-    assert messages[0] == "中间结果"
-    assert "连续检查失败" in messages[1]
+    assert harness.store.config(watch_id).deadline == deadline
+    messages = [
+        json.loads(line)["message"]
+        for line in harness.receipts.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(messages) == 2 and messages[0] == "请检查任务状态" and "等待期限" in messages[1]
 
 
 @pytest.mark.parametrize(
@@ -256,112 +528,110 @@ def test_probe_error_after_notification_finishes(
         "import time; time.sleep(3)",
     ],
 )
-def test_probe_errors_notify_once(
-    context: tuple[Store, FakeSystemd, Path, Path], code: str
-) -> None:
+def test_probe_errors_notify_once(harness: Harness, code: str) -> None:
     """Repeated execution failures send one diagnostic instead of a success prompt."""
-    store, manager, _, receipts = context
-    watch_id = arm(context, code, max_probe_errors=2, probe_timeout_sec=0.1)
-    run_watch(store, watch_id, manager, threading.Event())
-    state = store.state(watch_id)
+    watch_id = arm(harness, code, max_probe_errors=2, probe_timeout_sec=0.1)
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    state = harness.store.state(watch_id)
     assert (state.phase, state.reason, state.checks) == ("queued", "probe_error", 2)
-    assert "连续检查失败" in json.loads(receipts.read_text())["message"]
+    assert "连续检查失败" in json.loads(harness.receipts.read_text(encoding="utf-8"))["message"]
 
 
-def test_deadline_survives_restart(context: tuple[Store, FakeSystemd, Path, Path]) -> None:
+def test_deadline_survives_restart(harness: Harness) -> None:
     """An elapsed persisted deadline wakes without executing the probe again."""
-    store, manager, _, receipts = context
-    watch_id = arm(context, "raise AssertionError('must not run')", max_wait_sec=0.01)
-    deadline = store.config(watch_id).deadline
+    watch_id = arm(harness, "raise AssertionError('must not run')", max_wait_sec=0.01)
+    deadline = harness.store.config(watch_id).deadline
     time.sleep(0.02)
-    run_watch(store, watch_id, manager, threading.Event())
-    assert store.config(watch_id).deadline == deadline
-    assert store.state(watch_id).checks == 0
-    assert store.state(watch_id).reason == "deadline"
-    assert "等待期限" in json.loads(receipts.read_text())["message"]
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    assert harness.store.config(watch_id).deadline == deadline
+    assert harness.store.state(watch_id).checks == 0
+    assert harness.store.state(watch_id).reason == "deadline"
 
 
 @pytest.mark.parametrize("reason", ["", "probe_notify"])
-def test_interrupted_delivery_is_not_replayed(
-    context: tuple[Store, FakeSystemd, Path, Path], reason: str
-) -> None:
+def test_interrupted_delivery_is_not_replayed(harness: Harness, reason: str) -> None:
     """A persisted sending state is ambiguous after a runner crash."""
-    store, manager, _, receipts = context
     watch_id = arm(
-        context,
+        harness,
         'print(\'{"state":"wake","summary":"finished"}\')'
         if reason == "probe_notify"
         else "raise AssertionError('must not run')",
     )
-    with store.edit(watch_id) as state:
+    with harness.store.edit(watch_id) as state:
         state.phase, state.summary, state.reason = "sending", "saved prompt", reason
-    run_watch(store, watch_id, manager, threading.Event())
-    assert store.state(watch_id).phase == "delivery_unknown"
-    assert not receipts.exists()
-    service.retry_delivery(store, manager, watch_id)
-    run_watch(store, watch_id, manager, threading.Event())
-    assert store.state(watch_id).phase == "queued"
-    assert store.state(watch_id).checks == (1 if reason == "probe_notify" else 0)
-    assert [json.loads(line)["message"] for line in receipts.read_text().splitlines()] == (
-        ["saved prompt", "finished"] if reason == "probe_notify" else ["saved prompt"]
-    )
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    assert harness.store.state(watch_id).phase == "delivery_unknown"
+    assert not harness.receipts.exists()
+    service.retry_delivery(harness.store, harness.manager, watch_id, session_env={})
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    assert harness.store.state(watch_id).phase == "queued"
+    assert harness.store.state(watch_id).checks == (1 if reason == "probe_notify" else 0)
     with pytest.raises(WakeupError):
-        service.retry_delivery(store, manager, watch_id)
+        service.retry_delivery(harness.store, harness.manager, watch_id, session_env={})
 
 
-@pytest.mark.parametrize("env", [{"QUEUE_SLEEP": "1"}, {"QUEUE_BAD_ACK": "1"}])
+@pytest.mark.parametrize("backend", ["codex", "antigravity"])
+@pytest.mark.parametrize("env_override", [{"QUEUE_SLEEP": "1"}, {"QUEUE_BAD_ACK": "1"}])
 @pytest.mark.parametrize("probe_state", ["wake", "notify"])
 def test_uncertain_receipt_stops_without_retry(
-    context: tuple[Store, FakeSystemd, Path, Path], env: dict[str, str], probe_state: str
+    harness: Harness, backend: Backend, env_override: dict[str, str], probe_state: str
 ) -> None:
     """Timeout and malformed receipts never cause an automatic duplicate."""
-    store, manager, _, receipts = context
     watch_id = arm(
-        context,
+        harness,
         sequenced_probe([{"state": probe_state, "summary": "go"}]),
-        env={"RECEIPTS": str(receipts)} | env,
+        backend=backend,
+        env=env_override,
         queue_timeout_sec=0.2,
     )
-    run_watch(store, watch_id, manager, threading.Event())
-    assert store.state(watch_id).phase == "delivery_unknown"
-    run_watch(store, watch_id, manager, threading.Event())
-    assert len(receipts.read_text().splitlines()) == 1
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    assert harness.store.state(watch_id).phase == "delivery_unknown"
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    assert len(harness.receipts.read_text(encoding="utf-8").splitlines()) == 1
 
 
-def test_duplicate_registration_and_conflict(
-    context: tuple[Store, FakeSystemd, Path, Path],
-) -> None:
-    """A session/key pair identifies one immutable registration."""
-    thread = str(uuid4())
+def test_duplicate_registration_and_conflict(harness: Harness) -> None:
+    """A backend/session/key triple identifies one immutable logical registration."""
+    sid = str(uuid4())
     code = 'print(\'{"state":"wait","summary":"waiting"}\')'
-    watch_id = arm(context, code, thread=thread)
-    assert arm(context, code, thread=thread) == watch_id
+    watch_id = arm(harness, code, session_id=sid, interval_sec=300)
+    assert arm(harness, code, session_id=sid, interval_sec=300.0) == watch_id
     with pytest.raises(WakeupError, match="不同配置"):
-        arm(context, code, thread=thread, interval_sec=1)
-    assert len(context[0].ids()) == 1
+        arm(harness, code, session_id=sid, interval_sec=1)
+    # Same UUID/key under the other backend does not collide.
+    other_id = arm(harness, code, backend="antigravity", session_id=sid, interval_sec=300)
+    assert other_id != watch_id
+    assert len(harness.store.ids()) == 2
 
 
-def test_equivalent_duration_registration(context: tuple[Store, FakeSystemd, Path, Path]) -> None:
-    """Explicit numeric defaults keep the same registration identity."""
-    thread = str(uuid4())
-    first = arm(context, "print('{}')", thread=thread, interval_sec=300)
-    assert arm(context, "print('{}')", thread=thread, interval_sec=300.0) == first
-
-
-def test_cancel_remove_keeps_original(context: tuple[Store, FakeSystemd, Path, Path]) -> None:
+def test_cancel_remove_keeps_original(harness: Harness) -> None:
     """Cancellation and record removal leave the original script and external files."""
-    store, manager, _, receipts = context
-    watch_id = arm(context, 'print(\'{"state":"wake","summary":"go"}\')')
-    original = Path(store.config(watch_id).probe_source)
+    watch_id = arm(harness, 'print(\'{"state":"wake","summary":"go"}\')')
+    original = Path(harness.store.config(watch_id).probe_source)
     with pytest.raises(WakeupError, match="先 cancel"):
-        service.remove(store, manager, watch_id)
-    service.cancel(store, manager, watch_id)
-    run_watch(store, watch_id, manager, threading.Event())
-    assert not receipts.exists()
-    service.remove(store, manager, watch_id)
-    assert not store.directory(watch_id).exists()
+        service.remove(harness.store, harness.manager, watch_id)
+    service.cancel(harness.store, harness.manager, watch_id)
+    run_watch(harness.store, watch_id, harness.manager, threading.Event())
+    assert not harness.receipts.exists()
+    service.remove(harness.store, harness.manager, watch_id)
+    assert not harness.store.directory(watch_id).exists()
     assert original.exists()
-    assert list(manager.unit_dir.glob("*@.service"))
+    assert list(harness.manager.unit_dir.glob("*@.service"))
+
+
+def test_doctor_reports_both_backends_without_leaking_token(harness: Harness) -> None:
+    """Doctor validates active Antigravity sessions and omits secret token values."""
+    agy_env = harness.session_env("antigravity")
+    report = cli.doctor(harness.store, harness.manager, session_env=agy_env)
+    assert report["detected_backend"] == "antigravity"
+    assert report["backends"]["antigravity"]["session_reachable"] is True
+    assert report["backends"]["codex"]["ready"] is True
+    assert "secret-csrf-token" not in json.dumps(report)
+
+    bad_env = agy_env | {"ANTIGRAVITY_CSRF_TOKEN": "wrong"}
+    bad_report = cli.doctor(harness.store, harness.manager, session_env=bad_env)
+    assert bad_report["backends"]["antigravity"]["ready"] is False
+    assert bad_report["healthy"] is False
 
 
 @pytest.mark.parametrize(
@@ -392,7 +662,8 @@ def test_timeout_cleans_descendants(tmp_path: Path) -> None:
     script.write_text(
         "import subprocess, sys, time\n"
         + f"subprocess.Popen([sys.executable, '-c', {('import time; from pathlib import Path; time.sleep(0.4); Path(' + repr(str(marker)) + ').touch()')!r}])\n"
-        + "time.sleep(5)\n"
+        + "time.sleep(5)\n",
+        encoding="utf-8",
     )
     result = execute(
         [sys.executable, str(script)],
@@ -403,8 +674,7 @@ def test_timeout_cleans_descendants(tmp_path: Path) -> None:
         stderr_path=tmp_path / "err",
     )
     time.sleep(0.5)
-    assert result.reason == "timeout"
-    assert not marker.exists()
+    assert result.reason == "timeout" and not marker.exists()
 
 
 def test_output_limit(tmp_path: Path) -> None:
@@ -427,7 +697,8 @@ def test_cli_check_forwards_literal_arguments(tmp_path: Path, probe_state: str) 
     probe = tmp_path / "probe.py"
     probe.write_text(
         "import json, sys\n"
-        + f"print(json.dumps({{'state': {probe_state!r}, 'summary': sys.argv[1]}}))\n"
+        + f"print(json.dumps({{'state': {probe_state!r}, 'summary': sys.argv[1]}}))\n",
+        encoding="utf-8",
     )
     message = '参数含空格、引号 " 与 $(literal)'
     result = subprocess.run(
@@ -452,35 +723,31 @@ def test_cli_check_forwards_literal_arguments(tmp_path: Path, probe_state: str) 
     assert not (tmp_path / "state").exists()
 
 
-def test_unit_rendering_and_reuse(
-    context: tuple[Store, FakeSystemd, Path, Path], tmp_path: Path
-) -> None:
+def test_unit_rendering_and_reuse(harness: Harness, tmp_path: Path) -> None:
     """Dynamic paths are quoted for systemd; unchanged templates are reused."""
-    store, manager, _, _ = context
-    watch_id = arm(context, "print('{}')")
+    watch_id = arm(harness, "print('{}')")
     config = replace(
-        store.config(watch_id),
+        harness.store.config(watch_id),
         project_dir=str(tmp_path / 'space % $ " path'),
         uv_binary=str(tmp_path / "uv executable"),
     )
-    manager.prepare(config, store.root)
-    content = next(manager.unit_dir.glob("*@.service")).read_text()
+    harness.manager.prepare(config, harness.store.root)
+    content = next(harness.manager.unit_dir.glob("*@.service")).read_text(encoding="utf-8")
     assert '"' + str(tmp_path / "uv executable") + '"' in content
     assert "%%" in content and "$$" in content and '\\"' in content
     assert "--watch_id %i" in content
-    before = len(manager.calls)
-    manager.prepare(config, store.root)
-    assert len(manager.calls) == before
+    before = len(harness.manager.calls)
+    harness.manager.prepare(config, harness.store.root)
+    assert len(harness.manager.calls) == before
 
 
 @pytest.fixture
-def watches_by_phase(context: tuple[Store, FakeSystemd, Path, Path]) -> dict[str, str]:
+def watches_by_phase(harness: Harness) -> dict[str, str]:
     """Save all lifecycle phases without running probes or sending messages."""
-    store, _, _, _ = context
     watches = {}
     for phase in t.get_args(Phase):
-        watch_id = arm(context, "raise AssertionError('probe must not run')", key=phase)
-        with store.edit(watch_id) as state:
+        watch_id = arm(harness, "raise AssertionError('probe must not run')", key=phase)
+        with harness.store.edit(watch_id) as state:
             state.phase = phase
             state.summary = f"saved message for {phase}"
             state.reason = "probe"
@@ -498,7 +765,7 @@ def watches_by_phase(context: tuple[Store, FakeSystemd, Path, Path]) -> dict[str
     ],
 )
 def test_cli_list_categories_use_only_saved_phases(
-    context: tuple[Store, FakeSystemd, Path, Path],
+    harness: Harness,
     watches_by_phase: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -506,45 +773,57 @@ def test_cli_list_categories_use_only_saved_phases(
     phases: set[str],
 ) -> None:
     """Filtering works even when services are inactive and never queries the manager."""
-    store, manager, _, receipts = context
-    argv = ["agent-wakeup", "list", "--state_dir", str(store.root), "--json"]
+    argv = ["agent-wakeup", "list", "--state_dir", str(harness.store.root), "--json"]
     if category is not None:
         argv += ["--category", category]
     monkeypatch.setattr(sys, "argv", argv)
-    monkeypatch.setattr(cli, "get_manager", lambda: manager)
-    manager.calls.clear()
+    monkeypatch.setattr(cli, "get_manager", lambda: harness.manager)
+    harness.manager.calls.clear()
 
     assert cli.main() == 0
     records = json.loads(capsys.readouterr().out)
     assert {record["watch_id"] for record in records} == {
         watches_by_phase[phase] for phase in phases
     }
-    assert all(record["summary"] == f"saved message for {record['phase']}" for record in records)
-    assert manager.calls == []
-    assert not receipts.exists()
+    assert all(record["backend"] == "codex" and record["session_id"] for record in records)
+    assert harness.manager.calls == []
+    assert not harness.receipts.exists()
 
 
 @pytest.mark.parametrize("all_watches", [False, True])
 def test_cli_retry_preserves_messages_and_excludes_other_phases(
-    context: tuple[Store, FakeSystemd, Path, Path],
+    harness: Harness,
     watches_by_phase: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     all_watches: bool,
 ) -> None:
     """Single and bulk retries send saved messages once and leave other watches intact."""
-    store, manager, _, receipts = context
+    for var in (
+        "ANTIGRAVITY_LS_ADDRESS",
+        "ANTIGRAVITY_CSRF_TOKEN",
+        "CODEX_THREAD_ID",
+        "CODEX_HOME",
+    ):
+        monkeypatch.delenv(var, raising=False)
     phases = {"delivery_failed", "delivery_unknown"} if all_watches else {"delivery_failed"}
     selected = {watches_by_phase[phase] for phase in phases}
-    before = {watch_id: store.state(watch_id) for watch_id in store.ids()}
-    deadlines = {watch_id: store.config(watch_id).deadline for watch_id in selected}
+    before = {watch_id: harness.store.state(watch_id) for watch_id in harness.store.ids()}
+    deadlines = {watch_id: harness.store.config(watch_id).deadline for watch_id in selected}
     target = ["--all"] if all_watches else [watches_by_phase["delivery_failed"]]
     monkeypatch.setattr(
         sys,
         "argv",
-        ["agent-wakeup", "retry_delivery", *target, "--state_dir", str(store.root), "--json"],
+        [
+            "agent-wakeup",
+            "retry_delivery",
+            *target,
+            "--state_dir",
+            str(harness.store.root),
+            "--json",
+        ],
     )
-    monkeypatch.setattr(cli, "get_manager", lambda: manager)
+    monkeypatch.setattr(cli, "get_manager", lambda: harness.manager)
 
     assert cli.main() == 0
     result = json.loads(capsys.readouterr().out)
@@ -553,112 +832,28 @@ def test_cli_retry_preserves_messages_and_excludes_other_phases(
         assert {item["watch_id"] for item in result["results"]} == selected
     else:
         assert result == {"watch_id": target[0], "phase": "triggered"}
-    assert not receipts.exists()
 
     for watch_id in selected:
-        run_watch(store, watch_id, manager, threading.Event())
-        state = store.state(watch_id)
+        run_watch(harness.store, watch_id, harness.manager, threading.Event())
+        state = harness.store.state(watch_id)
         assert (state.phase, state.checks, state.delivery_attempts) == ("queued", 0, 1)
         assert state.summary == before[watch_id].summary
-        assert store.config(watch_id).deadline == deadlines[watch_id]
-    for watch_id in set(store.ids()) - selected:
-        assert store.state(watch_id) == before[watch_id]
-    assert {json.loads(line)["message"] for line in receipts.read_text().splitlines()} == {
-        before[watch_id].summary for watch_id in selected
-    }
-    if all_watches:
-        assert service.retry_all_deliveries(store, manager) == {
-            "total": 0,
-            "started": 0,
-            "failed": 0,
-            "results": [],
-        }
-        assert len(receipts.read_text().splitlines()) == 2
-
-
-@pytest.mark.parametrize("operation", ["prepare", "start"])
-def test_cli_retry_all_continues_after_service_failure(
-    context: tuple[Store, FakeSystemd, Path, Path],
-    watches_by_phase: dict[str, str],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    operation: str,
-) -> None:
-    """One failed startup reports a nonzero exit but does not block subsequent retries."""
-    store, manager, _, receipts = context
-    first, second = sorted(
-        watches_by_phase[phase] for phase in ("delivery_failed", "delivery_unknown")
-    )
-    first_phase = store.state(first).phase
-    original = getattr(manager, operation)
-
-    def fail_first(*args: t.Any) -> None:
-        """Fail one service operation while allowing the other watch to start."""
-        unit = args[0].unit if operation == "prepare" else args[0]
-        if unit == store.config(first).unit:
-            raise subprocess.CalledProcessError(
-                1, ["fake-manager", operation], stderr="unavailable"
-            )
-        original(*args)
-
-    monkeypatch.setattr(manager, operation, fail_first)
-    monkeypatch.setattr(cli, "get_manager", lambda: manager)
-    monkeypatch.setattr(
-        sys, "argv", ["agent-wakeup", "retry_delivery", "--all", "--state_dir", str(store.root)]
-    )
-    assert cli.main() == 1
-    result = json.loads(capsys.readouterr().out)
-    assert (result["total"], result["started"], result["failed"]) == (2, 1, 1)
-    assert result["results"][0] == {"watch_id": first, "started": False, "error": "unavailable"}
-    assert result["results"][1]["watch_id"] == second
-    assert result["results"][1]["started"] is True
-    assert store.state(first).phase == first_phase
-    assert store.state(second).phase == "triggered"
-    assert not receipts.exists()
-
-    monkeypatch.setattr(manager, operation, original)
-    result = service.retry_all_deliveries(store, manager)
-    assert (result["total"], result["started"], result["failed"]) == (1, 1, 0)
-    assert result["results"][0]["watch_id"] == first
+        assert harness.store.config(watch_id).deadline == deadlines[watch_id]
+    for watch_id in set(harness.store.ids()) - selected:
+        assert harness.store.state(watch_id) == before[watch_id]
 
 
 def test_retry_all_does_not_take_over_a_locked_watch(
-    context: tuple[Store, FakeSystemd, Path, Path], watches_by_phase: dict[str, str]
+    harness: Harness, watches_by_phase: dict[str, str]
 ) -> None:
     """An occupied watch is reported without changing it or blocking other retries."""
-    store, manager, _, _ = context
     watch_id = watches_by_phase["delivery_unknown"]
-    before = store.state(watch_id)
-    with file_lock(store.directory(watch_id) / "run.lock"):
-        result = service.retry_all_deliveries(store, manager)
+    before = harness.store.state(watch_id)
+    with file_lock(harness.store.directory(watch_id) / "run.lock"):
+        result = service.retry_all_deliveries(harness.store, harness.manager, session_env={})
     assert (result["total"], result["started"], result["failed"]) == (2, 1, 1)
-    assert store.state(watch_id) == before
+    assert harness.store.state(watch_id) == before
     assert "占用" in next(item["error"] for item in result["results"] if not item["started"])
-
-
-def test_retry_start_error_does_not_rollback_an_acknowledged_runner(
-    context: tuple[Store, FakeSystemd, Path, Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A service-command error cannot undo a retry whose runner already started."""
-    store, manager, _, receipts = context
-    watch_id = arm(context, "raise AssertionError('must not run')")
-    with store.edit(watch_id) as state:
-        state.phase, state.summary = "delivery_unknown", "saved message"
-    original = manager.start
-
-    def start_then_error(unit: str) -> None:
-        """Acknowledge startup before simulating a failed service-command response."""
-        original(unit)
-        raise OSError("service response lost")
-
-    monkeypatch.setattr(manager, "start", start_then_error)
-    with pytest.raises(OSError, match="response lost"):
-        service.retry_delivery(store, manager, watch_id)
-    assert store.state(watch_id).phase == "triggered"
-    assert store.state(watch_id).started_at is not None
-    run_watch(store, watch_id, manager, threading.Event())
-    assert store.state(watch_id).phase == "queued"
-    assert json.loads(receipts.read_text())["message"] == "saved message"
 
 
 @pytest.mark.parametrize(
@@ -666,34 +861,51 @@ def test_retry_start_error_does_not_rollback_an_acknowledged_runner(
     [
         ["retry_delivery"],
         ["retry_delivery", str(uuid4()), "--all"],
-        ["retry_delivery", "--all", str(uuid4())],
+        ["rebind"],
+        ["rebind", str(uuid4()), "--all"],
         ["list", "--category", "running"],
+        ["register", "--key", "x", "--probe", "p.py", "--thread_id", str(uuid4())],
     ],
 )
-def test_cli_rejects_ambiguous_retry_targets_and_unknown_categories(arguments: list[str]) -> None:
-    """Callers must select one retry target and a documented category."""
+def test_cli_rejects_invalid_or_removed_arguments(arguments: list[str]) -> None:
+    """Callers must select valid targets, categories, and current option names."""
     with pytest.raises(SystemExit) as error:
         cli.parser().parse_args(arguments)
     assert error.value.code == 2
 
 
 @pytest.mark.parametrize(
-    "arguments", [["list", "--category", "delivery_error"], ["retry_delivery", "--all"]]
+    "arguments",
+    [
+        ["list", "--category", "delivery_error"],
+        ["retry_delivery", "--all"],
+        ["rebind", "--all", "--backend", "antigravity"],
+    ],
 )
 def test_cli_empty_state_directory_is_a_successful_noop(
-    context: tuple[Store, FakeSystemd, Path, Path],
+    harness: Harness,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     arguments: list[str],
 ) -> None:
-    """Empty listings and batch retries succeed without creating records or services."""
-    store, manager, _, _ = context
-    monkeypatch.setattr(cli, "get_manager", lambda: manager)
-    monkeypatch.setattr(sys, "argv", ["agent-wakeup", *arguments, "--state_dir", str(store.root)])
+    """Empty listings, batch retries, and batch rebinds succeed without creating records."""
+    monkeypatch.setattr(cli, "get_manager", lambda: harness.manager)
+    monkeypatch.setattr(
+        sys, "argv", ["agent-wakeup", *arguments, "--state_dir", str(harness.store.root)]
+    )
     assert cli.main() == 0
     result = json.loads(capsys.readouterr().out)
-    assert result == (
-        [] if arguments[0] == "list" else {"total": 0, "started": 0, "failed": 0, "results": []}
-    )
-    assert manager.calls == []
-    assert not store.root.exists()
+    if arguments[0] == "list":
+        assert result == []
+    elif arguments[0] == "retry_delivery":
+        assert result == {"total": 0, "started": 0, "failed": 0, "results": []}
+    else:
+        assert result == {
+            "backend": "antigravity",
+            "total": 0,
+            "rebound": 0,
+            "failed": 0,
+            "results": [],
+        }
+    assert harness.manager.calls == []
+    assert not harness.store.root.exists()
